@@ -51,6 +51,7 @@ mod simple_checkpoint {
         let table = table_result;
         let files = table.get_files_iter().unwrap();
         assert_eq!(12, files.count());
+        assert_eq!(12, table.snapshot().unwrap().file_actions().unwrap().len());
     }
 
     fn get_last_checkpoint_version(log_path: &Path) -> i64 {

@@ -212,7 +212,7 @@ pub(crate) fn delta_log_schema_for_table(
             size:Int64,
             modificationTime:Int64,
             dataChange:Boolean,
-            stats:Utf8,
+            // stats:Utf8, // uncomment to make test pass
             partitionValues,
             tags,
             deletionVector[
