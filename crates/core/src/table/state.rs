@@ -45,6 +45,13 @@ impl DeltaTableState {
         Ok(Self { snapshot })
     }
 
+    #[allow(missing_docs)]
+    pub fn clone_inner(&self) -> Self {
+        Self {
+            snapshot: self.snapshot.clone()
+        }
+    }
+
     /// Return table version
     pub fn version(&self) -> i64 {
         self.snapshot.version()

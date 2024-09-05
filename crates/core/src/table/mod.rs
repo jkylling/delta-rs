@@ -4,6 +4,7 @@ use std::cmp::{min, Ordering};
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt};
@@ -192,7 +193,7 @@ pub enum PeekCommit {
 #[derive(Clone)]
 pub struct DeltaTable {
     /// The state of the table as of the most recent loaded Delta log entry.
-    pub state: Option<DeltaTableState>,
+    pub state: Option<Arc<DeltaTableState>>,
     /// the load options used during load
     pub config: DeltaTableConfig,
     /// log store
@@ -276,7 +277,7 @@ impl DeltaTable {
     /// please call one of the `open_table` helper methods instead.
     pub(crate) fn new_with_state(log_store: LogStoreRef, state: DeltaTableState) -> Self {
         Self {
-            state: Some(state),
+            state: Some(state.into()),
             log_store,
             config: Default::default(),
         }
@@ -341,7 +342,7 @@ impl DeltaTable {
         max_version: Option<i64>,
     ) -> Result<(), DeltaTableError> {
         match self.state.as_mut() {
-            Some(state) => state.update(self.log_store.clone(), max_version).await,
+            Some(state) => state.clone_inner().update(self.log_store.clone(), max_version).await,
             _ => {
                 let state = DeltaTableState::try_new(
                     &Path::default(),
@@ -350,7 +351,7 @@ impl DeltaTable {
                     max_version,
                 )
                 .await?;
-                self.state = Some(state);
+                self.state = Some(state.into());
                 Ok(())
             }
         }
@@ -464,7 +465,12 @@ impl DeltaTable {
 
     /// Returns the currently loaded state snapshot.
     pub fn snapshot(&self) -> DeltaResult<&DeltaTableState> {
-        self.state.as_ref().ok_or(DeltaTableError::NotInitialized)
+        self.state.as_ref().map(Arc::as_ref).ok_or(DeltaTableError::NotInitialized)
+    }
+
+    /// Returns the currently loaded state snapshot.
+    pub fn snapshot_arc(&self) -> DeltaResult<Arc<DeltaTableState>> {
+        self.state.as_ref().map(Arc::clone).ok_or(DeltaTableError::NotInitialized)
     }
 
     /// Returns current table protocol

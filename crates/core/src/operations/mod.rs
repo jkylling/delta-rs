@@ -38,6 +38,7 @@ use arrow::record_batch::RecordBatch;
 use optimize::OptimizeBuilder;
 use restore::RestoreBuilder;
 use set_tbl_properties::SetTablePropertiesBuilder;
+use crate::table::state::DeltaTableState;
 
 #[cfg(all(feature = "cdf", feature = "datafusion"))]
 mod cdc;
@@ -139,59 +140,59 @@ impl DeltaOps {
     #[cfg(feature = "datafusion")]
     #[must_use]
     pub fn load(self) -> LoadBuilder {
-        LoadBuilder::new(self.0.log_store, self.0.state.unwrap())
+        LoadBuilder::new(self.0.log_store, self.0.state.unwrap().clone_inner())
     }
 
     /// Load a table with CDF Enabled
     #[cfg(feature = "datafusion")]
     #[must_use]
     pub fn load_cdf(self) -> CdfLoadBuilder {
-        CdfLoadBuilder::new(self.0.log_store, self.0.state.unwrap())
+        CdfLoadBuilder::new(self.0.log_store, self.0.state.unwrap().clone_inner())
     }
 
     /// Write data to Delta table
     #[cfg(feature = "datafusion")]
     #[must_use]
     pub fn write(self, batches: impl IntoIterator<Item = RecordBatch>) -> WriteBuilder {
-        WriteBuilder::new(self.0.log_store, self.0.state).with_input_batches(batches)
+        WriteBuilder::new(self.0.log_store, self.0.state.map(|x| x.clone_inner())).with_input_batches(batches)
     }
 
     /// Vacuum stale files from delta table
     #[must_use]
     pub fn vacuum(self) -> VacuumBuilder {
-        VacuumBuilder::new(self.0.log_store, self.0.state.unwrap())
+        VacuumBuilder::new(self.0.log_store, self.0.state.unwrap().clone_inner())
     }
 
     /// Audit active files with files present on the filesystem
     #[must_use]
     pub fn filesystem_check(self) -> FileSystemCheckBuilder {
-        FileSystemCheckBuilder::new(self.0.log_store, self.0.state.unwrap())
+        FileSystemCheckBuilder::new(self.0.log_store, self.0.state.unwrap().clone_inner())
     }
 
     /// Audit active files with files present on the filesystem
     #[must_use]
     pub fn optimize<'a>(self) -> OptimizeBuilder<'a> {
-        OptimizeBuilder::new(self.0.log_store, self.0.state.unwrap())
+        OptimizeBuilder::new(self.0.log_store, self.0.state.unwrap().clone_inner())
     }
 
     /// Delete data from Delta table
     #[cfg(feature = "datafusion")]
     #[must_use]
     pub fn delete(self) -> DeleteBuilder {
-        DeleteBuilder::new(self.0.log_store, self.0.state.unwrap())
+        DeleteBuilder::new(self.0.log_store, self.0.state.unwrap().clone_inner())
     }
 
     /// Update data from Delta table
     #[cfg(feature = "datafusion")]
     #[must_use]
     pub fn update(self) -> UpdateBuilder {
-        UpdateBuilder::new(self.0.log_store, self.0.state.unwrap())
+        UpdateBuilder::new(self.0.log_store, self.0.state.unwrap().clone_inner())
     }
 
     /// Restore delta table to a specified version or datetime
     #[must_use]
     pub fn restore(self) -> RestoreBuilder {
-        RestoreBuilder::new(self.0.log_store, self.0.state.unwrap())
+        RestoreBuilder::new(self.0.log_store, self.0.state.unwrap().clone_inner())
     }
 
     /// Update data from Delta table
@@ -204,7 +205,7 @@ impl DeltaOps {
     ) -> MergeBuilder {
         MergeBuilder::new(
             self.0.log_store,
-            self.0.state.unwrap(),
+            self.0.state.unwrap().clone_inner(),
             predicate.into(),
             source,
         )
@@ -214,19 +215,19 @@ impl DeltaOps {
     #[cfg(feature = "datafusion")]
     #[must_use]
     pub fn add_constraint(self) -> ConstraintBuilder {
-        ConstraintBuilder::new(self.0.log_store, self.0.state.unwrap())
+        ConstraintBuilder::new(self.0.log_store, self.0.state.unwrap().clone_inner())
     }
 
     /// Drops constraints from a table
     #[cfg(feature = "datafusion")]
     #[must_use]
     pub fn drop_constraints(self) -> DropConstraintBuilder {
-        DropConstraintBuilder::new(self.0.log_store, self.0.state.unwrap())
+        DropConstraintBuilder::new(self.0.log_store, self.0.state.unwrap().clone_inner())
     }
 
     /// Set table properties
     pub fn set_tbl_properties(self) -> SetTablePropertiesBuilder {
-        SetTablePropertiesBuilder::new(self.0.log_store, self.0.state.unwrap())
+        SetTablePropertiesBuilder::new(self.0.log_store, self.0.state.unwrap().clone_inner())
     }
 }
 
