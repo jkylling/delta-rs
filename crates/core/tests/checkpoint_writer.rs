@@ -53,6 +53,28 @@ mod simple_checkpoint {
         assert_eq!(12, files.count());
     }
 
+    #[tokio::test]
+    async fn checkpoint_test_not_all_stats() {
+        let table_location = "../test/tests/data/delta-checkpoint-not-all-stats";
+        let table_path = PathBuf::from(table_location);
+        let log_path = table_path.join("_delta_log");
+
+        // Delete checkpoint files from previous runs
+        cleanup_checkpoint_files(log_path.as_path());
+
+        // Load the delta table at version 5
+        let table = deltalake_core::open_table(table_location)
+            .await
+            .unwrap();
+
+        // Write a checkpoint
+        checkpoints::create_checkpoint(&table).await.unwrap();
+
+        // checkpoint should exist
+        let checkpoint_path = log_path.join("00000000000000000002.checkpoint.parquet");
+        assert!(checkpoint_path.as_path().exists());
+    }
+
     fn get_last_checkpoint_version(log_path: &Path) -> i64 {
         let last_checkpoint_path = log_path.join("_last_checkpoint");
         assert!(last_checkpoint_path.as_path().exists());
