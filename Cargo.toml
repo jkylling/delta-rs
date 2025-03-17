@@ -77,3 +77,29 @@ async-trait = { version = "0.1" }
 futures = { version = "0.3" }
 tokio = { version = "1" }
 num_cpus = { version = "1" }
+
+[patch.crates-io]
+arrow = { version = "54", path = "../arrow-rs/arrow" }
+arrow-arith = { version = "54", path = "../arrow-rs/arrow-arith" }
+arrow-array = { version = "54", path = "../arrow-rs/arrow-array" }
+arrow-buffer = { version = "54", path = "../arrow-rs/arrow-buffer" }
+arrow-cast = { version = "54", path = "../arrow-rs/arrow-cast" }
+arrow-ipc = { version = "54", path = "../arrow-rs/arrow-ipc" }
+arrow-json = { version = "54", path = "../arrow-rs/arrow-json" }
+arrow-ord = { version = "54", path = "../arrow-rs/arrow-ord" }
+arrow-row = { version = "54", path = "../arrow-rs/arrow-row" }
+arrow-schema = { version = "54", path = "../arrow-rs/arrow-schema" }
+arrow-select = { version = "54", path = "../arrow-rs/arrow-select" }
+#object_store = { version = "0.11.2", path = "../arrow-rs/object_store"}
+parquet = { version = "54", path = "../arrow-rs/parquet" }
+
+datafusion = { path = "../datafusion/datafusion/core" }
+datafusion-expr = { path = "../datafusion/datafusion/expr" }
+datafusion-common = { path = "../datafusion/datafusion/common" }
+datafusion-ffi = { path = "../datafusion/datafusion/ffi" }
+datafusion-functions = { path = "../datafusion/datafusion/functions" }
+datafusion-functions-aggregate = { path = "../datafusion/datafusion/functions-aggregate" }
+datafusion-physical-expr = { path = "../datafusion/datafusion/physical-expr" }
+datafusion-physical-plan = { path = "../datafusion/datafusion/physical-plan" }
+datafusion-proto = { path = "../datafusion/datafusion/proto" }
+datafusion-sql = { path = "../datafusion/datafusion/sql" }
