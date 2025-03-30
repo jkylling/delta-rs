@@ -18,6 +18,10 @@ impl SchemaAdapterFactory for DeltaSchemaAdapterFactory {
         projected_table_schema: SchemaRef,
         table_schema: SchemaRef,
     ) -> Box<dyn SchemaAdapter> {
+        println!(
+            "projected_table_schema={:#?}\ntable_schema={:#?}",
+            projected_table_schema, table_schema
+        );
         Box::new(DeltaSchemaAdapter {
             projected_table_schema,
             table_schema,

@@ -1130,10 +1130,13 @@ pub(crate) mod serde_path {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
     use crate::kernel::PrimitiveType;
+    use object_store::path::Path;
+    use parquet::data_type::AsBytes;
+    use roaring::RoaringTreemap;
+    use std::io::Write;
+    use std::path::PathBuf;
 
     fn dv_relateive() -> DeletionVectorDescriptor {
         DeletionVectorDescriptor {
@@ -1209,6 +1212,35 @@ mod tests {
     fn test_primitive() {
         let types: PrimitiveType = serde_json::from_str("\"string\"").unwrap();
         println!("{types:?}");
+    }
+
+    fn write_deletion_vector(
+        mut writer: impl Write + Clone,
+        path: String,
+        bitmaps: &[RoaringTreemap],
+    ) -> std::io::Result<Vec<delta_kernel::actions::deletion_vector::DeletionVectorDescriptor>>
+    {
+        let mut out = vec![];
+        for bitmap in bitmaps {
+            writer.write_all(&(1681511377_i64.to_be_bytes()))?;
+            bitmap.serialize_into(writer.clone())?;
+            let descriptor = delta_kernel::actions::deletion_vector::DeletionVectorDescriptor {
+                storage_type: "p".to_string(),
+                path_or_inline_dv: path.clone(),
+                offset: None,
+                size_in_bytes: bitmap.serialized_size() as i32,
+                cardinality: bitmap.len() as i64,
+            };
+            out.push(descriptor);
+        }
+
+        Ok(out)
+    }
+
+    #[test]
+    fn test_write_deletion_vector() {
+
+        //let desc = delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
     }
 
     // #[test]

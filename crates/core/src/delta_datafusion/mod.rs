@@ -51,8 +51,8 @@ use datafusion::physical_optimizer::pruning::PruningPredicate;
 use datafusion_common::scalar::ScalarValue;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_common::{
-    config::ConfigOptions, Column, DFSchema, DataFusionError, Result as DataFusionResult,
-    TableReference, ToDFSchema,
+    config::ConfigOptions, Column, ColumnStatistics, DFSchema, DataFusionError,
+    Result as DataFusionResult, TableReference, ToDFSchema,
 };
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::logical_plan::CreateExternalTable;
@@ -300,6 +300,7 @@ pub(crate) fn register_store(store: LogStoreRef, env: Arc<RuntimeEnv>) {
 pub(crate) fn df_logical_schema(
     snapshot: &DeltaTableState,
     file_column_name: &Option<String>,
+    row_number_column: &Option<String>,
     schema: Option<ArrowSchemaRef>,
 ) -> DeltaResult<SchemaRef> {
     let input_schema = match schema {
@@ -324,11 +325,19 @@ pub(crate) fn df_logical_schema(
         ));
     }
 
+    if let Some(row_number_column) = row_number_column {
+        fields.push(Arc::new(Field::new(
+            row_number_column,
+            ArrowDataType::UInt64,
+            false,
+        )));
+    }
+
     if let Some(file_column_name) = file_column_name {
         fields.push(Arc::new(Field::new(
             file_column_name,
             ArrowDataType::Utf8,
-            true,
+            true, // TODO: Why is this nullable?
         )));
     }
 
@@ -351,6 +360,8 @@ pub struct DeltaScanConfigBuilder {
     enable_parquet_pushdown: bool,
     /// Schema to scan table with
     schema: Option<SchemaRef>,
+    /// Row number column name
+    row_number_column: Option<String>,
 }
 
 impl Default for DeltaScanConfigBuilder {
@@ -361,6 +372,7 @@ impl Default for DeltaScanConfigBuilder {
             wrap_partition_values: None,
             enable_parquet_pushdown: true,
             schema: None,
+            row_number_column: None,
         }
     }
 }
@@ -405,6 +417,12 @@ impl DeltaScanConfigBuilder {
         self
     }
 
+    /// Use the provided row number column name for the [DeltaScan]
+    pub fn with_row_number_column(mut self, row_number_column: Option<String>) -> Self {
+        self.row_number_column = row_number_column;
+        self
+    }
+
     /// Build a DeltaScanConfig and ensure no column name conflicts occur during downstream processing
     pub fn build(&self, snapshot: &DeltaTableState) -> DeltaResult<DeltaScanConfig> {
         let file_column_name = if self.include_file_column {
@@ -446,6 +464,7 @@ impl DeltaScanConfigBuilder {
             wrap_partition_values: self.wrap_partition_values.unwrap_or(true),
             enable_parquet_pushdown: self.enable_parquet_pushdown,
             schema: self.schema.clone(),
+            row_number_column: self.row_number_column.clone(),
         })
     }
 }
@@ -461,6 +480,8 @@ pub struct DeltaScanConfig {
     pub enable_parquet_pushdown: bool,
     /// Schema to read as
     pub schema: Option<SchemaRef>,
+    /// Row number column name
+    pub row_number_column: Option<String>,
 }
 
 pub(crate) struct DeltaScanBuilder<'a> {
@@ -503,6 +524,7 @@ impl<'a> DeltaScanBuilder<'a> {
     }
 
     pub fn with_projection(mut self, projection: Option<&'a Vec<usize>>) -> Self {
+        println!("set projection={:#?}", projection);
         self.projection = projection;
         self
     }
@@ -531,6 +553,7 @@ impl<'a> DeltaScanBuilder<'a> {
         let logical_schema = df_logical_schema(
             self.snapshot,
             &config.file_column_name,
+            &config.row_number_column,
             Some(schema.clone()),
         )?;
 
@@ -622,14 +645,18 @@ impl<'a> DeltaScanBuilder<'a> {
                 .push(part);
         }
 
-        let file_schema = Arc::new(ArrowSchema::new(
-            schema
-                .fields()
-                .iter()
-                .filter(|f| !table_partition_cols.contains(f.name()))
-                .cloned()
-                .collect::<Vec<arrow::datatypes::FieldRef>>(),
-        ));
+        let mut fields = schema
+            .fields()
+            .iter()
+            .filter(|f| !table_partition_cols.contains(f.name()))
+            .cloned()
+            .collect::<Vec<arrow::datatypes::FieldRef>>();
+        if let Some(column_name) = config.row_number_column.as_ref() {
+            let field = Field::new(column_name.clone(), ArrowDataType::UInt64, false);
+            let field = Arc::new(field);
+            fields.push(field);
+        }
+        let file_schema = Arc::new(ArrowSchema::new(fields));
 
         let mut table_partition_cols = table_partition_cols
             .iter()
@@ -649,10 +676,16 @@ impl<'a> DeltaScanBuilder<'a> {
             ));
         }
 
-        let stats = self
+        let mut stats = self
             .snapshot
             .datafusion_table_statistics()
             .unwrap_or(Statistics::new_unknown(&schema));
+
+        if config.row_number_column.is_some() {
+            stats
+                .column_statistics
+                .push(ColumnStatistics::new_unknown());
+        }
 
         let parquet_options = TableParquetOptions {
             global: self.session.config().options().execution.parquet.clone(),
@@ -660,7 +693,8 @@ impl<'a> DeltaScanBuilder<'a> {
         };
 
         let mut file_source = ParquetSource::new(parquet_options)
-            .with_schema_adapter_factory(Arc::new(DeltaSchemaAdapterFactory {}));
+            .with_schema_adapter_factory(Arc::new(DeltaSchemaAdapterFactory {}))
+            .with_row_number_column(config.row_number_column.clone());
 
         // Sometimes (i.e Merge) we want to prune files that don't make the
         // filter and read the entire contents for files that do match the
@@ -671,6 +705,8 @@ impl<'a> DeltaScanBuilder<'a> {
             }
         };
 
+        println!("file_schema={:#?}", file_schema);
+        println!("projection={:#?}", self.projection);
         let file_scan_config = FileScanConfig::new(
             self.log_store.object_store_url(),
             file_schema,
@@ -786,7 +822,12 @@ impl DeltaTableProvider {
         config: DeltaScanConfig,
     ) -> DeltaResult<Self> {
         Ok(DeltaTableProvider {
-            schema: df_logical_schema(&snapshot, &config.file_column_name, config.schema.clone())?,
+            schema: df_logical_schema(
+                &snapshot,
+                &config.file_column_name,
+                &config.row_number_column,
+                config.schema.clone(),
+            )?,
             snapshot,
             log_store,
             config,
@@ -1717,7 +1758,12 @@ pub(crate) async fn find_files_scan(
     }
     .build(snapshot)?;
 
-    let logical_schema = df_logical_schema(snapshot, &scan_config.file_column_name, None)?;
+    let logical_schema = df_logical_schema(
+        snapshot,
+        &scan_config.file_column_name,
+        &scan_config.row_number_column,
+        None,
+    )?;
 
     // Identify which columns we need to project
     let mut used_columns = expression
@@ -1971,6 +2017,7 @@ mod tests {
     use arrow::array::StructArray;
     use arrow::datatypes::{Field, Schema};
     use arrow_array::cast::AsArray;
+    use arrow_array::types::{Int64Type, UInt64Type};
     use bytes::Bytes;
     use chrono::{TimeZone, Utc};
     use datafusion::assert_batches_sorted_eq;
@@ -3128,5 +3175,63 @@ mod tests {
         async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
             self.inner.rename_if_not_exists(from, to).await
         }
+    }
+
+    #[tokio::test]
+    async fn read_table_with_parquet_row_numbers() {
+        let values: Arc<dyn Array> = Arc::new(arrow::array::StringArray::from(vec!["1", "2", "3"]));
+        let batch = RecordBatch::try_from_iter(vec![("value", values)]).unwrap();
+        let table = crate::DeltaOps::new_in_memory()
+            .write(vec![batch])
+            .with_save_mode(crate::protocol::SaveMode::Append)
+            .await
+            .unwrap();
+
+        let config = DeltaScanConfigBuilder::new()
+            .with_row_number_column(Some("row_number".to_string()))
+            .build(table.snapshot().unwrap())
+            .unwrap();
+        let provider = DeltaTableProvider::try_new(
+            table.snapshot().unwrap().clone(),
+            table.log_store(),
+            config,
+        )
+        .unwrap();
+
+        let schema = provider.schema();
+        assert_eq!(schema.fields.len(), 2);
+        assert_eq!(
+            Field::clone(schema.fields[0].as_ref()),
+            Field::new("value", ArrowDataType::Utf8, false)
+        );
+        assert_eq!(
+            Field::clone(schema.fields[1].as_ref()),
+            Field::new("row_number", ArrowDataType::UInt64, false)
+        );
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", Arc::new(provider)).unwrap();
+        let state = ctx.state();
+        let df = ctx.sql("select row_number, value from test").await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+
+        let mut stream = plan.execute(0, state.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.expect("Failed to collect");
+        assert_eq!(1, batches.len());
+        let batch = &batches[0];
+        assert_eq!(2, batch.num_columns());
+        assert_eq!(3, batch.num_rows());
+        assert_eq!(batch.schema().fields()[0], schema.fields[1]);
+        assert_eq!(batch.schema().fields()[1], schema.fields[0]);
+
+        let value = batch.column_by_name("value").unwrap().as_string::<i32>();
+        let row_number = batch
+            .column_by_name("row_number")
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+        let values = value.iter().collect::<Vec<_>>();
+        let row_numbers = row_number.iter().collect::<Vec<_>>();
+        assert_eq!(values, vec![Some("1"), Some("2"), Some("3")]);
+        assert_eq!(row_numbers, vec![Some(0), Some(1), Some(2)]);
     }
 }

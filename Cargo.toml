@@ -65,6 +65,7 @@ strum = { version = "0.26"}
 # "stdlib"
 bytes = { version = "1" }
 chrono = { version = "=0.4.39", default-features = false, features = ["clock"] }
+crc32fast = { version = "1.4.2" }
 tracing = { version = "0.1", features = ["log"] }
 regex = { version = "1" }
 thiserror = { version = "2" }
