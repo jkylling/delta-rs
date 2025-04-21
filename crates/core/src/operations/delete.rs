@@ -518,8 +518,7 @@ async fn deletion_vectors_execution_plan(
     // TODO: Refactor such that we do a union of execution for files with deletion vectors and without
     // TODO: Merge with existing deletion vectors if they exist. That is, make an initial pass over touched files, read their deletion vectors (in parallel) and merge them with the new deletion vectors.
     // TODO: Test multiple ways of reading and writing deletion vectors
-    // TODO: Test reading deletion vectors produced by Spark. Multiple scenarios
-    // TODO: Handle absolute path deletion vectors
+    // TODO: Handle or ban absolute path deletion vectors
     // Write deletion vector files
     let deletion_vector_descriptors =
         write_deletion_vectors_object_store(object_store, deletion_vectors).await?;
@@ -780,7 +779,7 @@ mod tests {
     use crate::writer::test_utils::{
         get_arrow_schema, get_delta_schema, get_record_batch, setup_table_with_configuration,
     };
-    use crate::DeltaTable;
+    use crate::{DeltaTable, DeltaTableBuilder};
     use crate::TableProperty;
     use arrow::array::Array;
     use arrow::array::AsArray;
@@ -803,8 +802,9 @@ mod tests {
     use object_store::ObjectStore;
     use serde_json::json;
     use std::io::Write;
+    use std::path::{absolute, PathBuf};
     use std::sync::Arc;
-    use arrow_array::types::{UInt16Type, UInt64Type};
+    use arrow_array::types::{Int32Type, UInt16Type, UInt64Type};
     use url::Url;
 
     async fn setup_table(partitions: Option<Vec<&str>>) -> DeltaTable {
@@ -1595,8 +1595,19 @@ mod tests {
         let batches =
             read_from_test_table_with_config_builder(&table, scan_config_builder, sql).await;
 
+        let actual_data = read_string_data(batches);
+
+        let expected_data = expected_data.into_iter().map(|data| {
+            data.into_iter()
+                .map(|x| x.replace("file_name", file_name))
+                .collect::<Vec<_>>()
+        }).collect::<Vec<_>>();
+        assert_eq!(actual_data, expected_data);
+    }
+
+    fn read_string_data(batches: Vec<RecordBatch>) -> Vec<Vec<String>> {
         let batch = batches.first().unwrap();
-        let actual_data = batch
+        batch
             .columns()
             .into_iter()
             .map(|column| {
@@ -1625,17 +1636,17 @@ mod tests {
                             .map(|x| x.to_string())
                             .collect::<Vec<_>>()
                     }
+                    DataType::Int32 => {
+                        column.as_primitive::<Int32Type>()
+                            .into_iter()
+                            .map(Option::unwrap)
+                            .map(|x| x.to_string())
+                            .collect::<Vec<_>>()
+                    }
                     _ => panic!("Unsupported type {}", column.data_type())
                 }
             })
-            .collect::<Vec<_>>();
-
-        let expected_data = expected_data.into_iter().map(|data| {
-            data.into_iter()
-                .map(|x| x.replace("file_name", file_name))
-                .collect::<Vec<_>>()
-        }).collect::<Vec<_>>();
-        assert_eq!(actual_data, expected_data);
+            .collect::<Vec<_>>()
     }
 
     #[tokio::test]
@@ -1787,5 +1798,25 @@ mod tests {
                 .with_row_number_column(Some("row_number".to_string()))
                 .with_file_column_name(&"file_name"),
         ).await;
+    }
+
+    #[tokio::test]
+    async fn read_spark_deletion_vectors() {
+        let mut table = DeltaTableBuilder::from_uri("./tests/data/spark/deletion-vectors").build().unwrap();
+        table.load().await.unwrap();
+
+        let batches = read_from_test_table(&table, "select value from test order by value").await;
+        let actual_data = read_string_data(batches);
+        assert_eq!(vec![vec!["1", "3"]], actual_data);
+    }
+
+    #[tokio::test]
+    async fn read_spark_deletion_vectors_2() {
+        let mut table = DeltaTableBuilder::from_uri("./tests/data/spark/deletion-vectors-2").build().unwrap();
+        table.load().await.unwrap();
+
+        let batches = read_from_test_table(&table, "select value from test order by value").await;
+        let actual_data = read_string_data(batches);
+        assert_eq!(vec![vec!["1", "1", "3", "3"]], actual_data);
     }
 }
