@@ -31,7 +31,7 @@ use arrow_array::{Array, DictionaryArray, RecordBatch, StringArray, TypedDiction
 use arrow_cast::display::array_value_to_string;
 use arrow_cast::{cast_with_options, CastOptions};
 use arrow_schema::{
-    ArrowError, DataType as ArrowDataType, Field, Schema as ArrowSchema, SchemaRef,
+    ArrowError, DataType as ArrowDataType, Field, FieldRef, Schema as ArrowSchema, SchemaRef,
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
 use arrow_select::concat::concat_batches;
@@ -40,7 +40,8 @@ use chrono::{DateTime, TimeZone, Utc};
 use datafusion::catalog::{Session, TableProviderFactory};
 use datafusion::config::TableParquetOptions;
 use datafusion::datasource::physical_plan::{
-    wrap_partition_type_in_dict, wrap_partition_value_in_dict, FileScanConfig, ParquetSource,
+    wrap_partition_type_in_dict, wrap_partition_value_in_dict, FileScanConfig, FileSource,
+    ParquetSource,
 };
 use datafusion::datasource::{listing::PartitionedFile, MemTable, TableProvider, TableType};
 use datafusion::execution::context::{SessionConfig, SessionContext, SessionState, TaskContext};
@@ -84,7 +85,9 @@ use url::Url;
 use crate::delta_datafusion::expr::parse_predicate_expression;
 use crate::delta_datafusion::schema_adapter::DeltaSchemaAdapterFactory;
 use crate::errors::{DeltaResult, DeltaTableError};
-use crate::kernel::{Add, DataCheck, EagerSnapshot, Invariant, Snapshot, StructTypeExt};
+use crate::kernel::{
+    Add, DataCheck, DeletionVectorDescriptor, EagerSnapshot, Invariant, Snapshot, StructTypeExt,
+};
 use crate::logstore::LogStoreRef;
 use crate::table::builder::ensure_table_uri;
 use crate::table::state::DeltaTableState;
@@ -99,8 +102,10 @@ pub mod logical;
 pub mod physical;
 pub mod planner;
 
+use crate::delta_datafusion::deletion_vector_file_source::DeletionVectorFileSource;
 pub use cdf::scan::DeltaCdfTableProvider;
 
+mod deletion_vector_file_source;
 mod schema_adapter;
 
 impl From<DeltaTableError> for DataFusionError {
@@ -299,13 +304,13 @@ pub(crate) fn register_store(store: LogStoreRef, env: Arc<RuntimeEnv>) {
 /// at the physical level
 pub(crate) fn df_logical_schema(
     snapshot: &DeltaTableState,
-    file_column_name: &Option<String>,
-    row_number_column: &Option<String>,
+    config: &DeltaScanConfig,
     schema: Option<ArrowSchemaRef>,
+    projection: Option<&Vec<usize>>,
 ) -> DeltaResult<SchemaRef> {
     let input_schema = match schema {
         Some(schema) => schema,
-        None => snapshot.input_schema()?,
+        None => snapshot.input_schema()?, // TODO: Input schema here, but arrow schema elsewhere??
     };
     let table_partition_cols = &snapshot.metadata().partition_columns;
 
@@ -316,6 +321,22 @@ pub(crate) fn df_logical_schema(
         .cloned()
         .collect();
 
+    if let Some(row_number_column) = &config.row_number_column {
+        fields.push(Arc::new(Field::new(
+            row_number_column,
+            ArrowDataType::UInt64,
+            false,
+        )));
+    }
+
+    if let Some(row_number_column) = &config.is_row_deleted_column {
+        fields.push(Arc::new(Field::new(
+            row_number_column,
+            ArrowDataType::Boolean,
+            false,
+        )));
+    }
+
     for partition_col in table_partition_cols.iter() {
         fields.push(Arc::new(
             input_schema
@@ -325,21 +346,23 @@ pub(crate) fn df_logical_schema(
         ));
     }
 
-    if let Some(row_number_column) = row_number_column {
-        fields.push(Arc::new(Field::new(
-            row_number_column,
-            ArrowDataType::UInt64,
-            false,
-        )));
-    }
-
-    if let Some(file_column_name) = file_column_name {
+    if let Some(file_column_name) = &config.file_column_name {
         fields.push(Arc::new(Field::new(
             file_column_name,
             ArrowDataType::Utf8,
             true, // TODO: Why is this nullable?
         )));
     }
+
+    let fields = if let Some(used_columns) = projection {
+        let mut new_fields = vec![];
+        for idx in used_columns {
+            new_fields.push(fields[*idx].clone());
+        }
+        new_fields
+    } else {
+        fields
+    };
 
     Ok(Arc::new(ArrowSchema::new(fields)))
 }
@@ -362,6 +385,8 @@ pub struct DeltaScanConfigBuilder {
     schema: Option<SchemaRef>,
     /// Row number column name
     row_number_column: Option<String>,
+    /// Whether to use deletion vectors
+    deletion_vectors_enabled: bool,
 }
 
 impl Default for DeltaScanConfigBuilder {
@@ -373,6 +398,7 @@ impl Default for DeltaScanConfigBuilder {
             enable_parquet_pushdown: true,
             schema: None,
             row_number_column: None,
+            deletion_vectors_enabled: false,
         }
     }
 }
@@ -393,6 +419,7 @@ impl DeltaScanConfigBuilder {
 
     /// Indicate that a column containing a records file path is included and column name is user defined.
     pub fn with_file_column_name<S: ToString>(mut self, name: &S) -> Self {
+        // TODO: We probably want impl Into<String> here
         self.file_column_name = Some(name.to_string());
         self.include_file_column = true;
         self
@@ -420,6 +447,12 @@ impl DeltaScanConfigBuilder {
     /// Use the provided row number column name for the [DeltaScan]
     pub fn with_row_number_column(mut self, row_number_column: Option<String>) -> Self {
         self.row_number_column = row_number_column;
+        self
+    }
+
+    /// Enable deletion vectors for the [DeltaScan]
+    pub fn with_deletion_vectors(mut self, deletion_vectors_enabled: bool) -> Self {
+        self.deletion_vectors_enabled = deletion_vectors_enabled;
         self
     }
 
@@ -465,6 +498,8 @@ impl DeltaScanConfigBuilder {
             enable_parquet_pushdown: self.enable_parquet_pushdown,
             schema: self.schema.clone(),
             row_number_column: self.row_number_column.clone(),
+            is_row_deleted_column: None,
+            deletion_vectors_enabled: self.deletion_vectors_enabled,
         })
     }
 }
@@ -482,6 +517,10 @@ pub struct DeltaScanConfig {
     pub schema: Option<SchemaRef>,
     /// Row number column name
     pub row_number_column: Option<String>,
+    /// Row number column name
+    pub is_row_deleted_column: Option<String>,
+    /// If reading deletion vectors is enabled
+    pub deletion_vectors_enabled: bool,
 }
 
 pub(crate) struct DeltaScanBuilder<'a> {
@@ -524,7 +563,6 @@ impl<'a> DeltaScanBuilder<'a> {
     }
 
     pub fn with_projection(mut self, projection: Option<&'a Vec<usize>>) -> Self {
-        println!("set projection={:#?}", projection);
         self.projection = projection;
         self
     }
@@ -552,20 +590,10 @@ impl<'a> DeltaScanBuilder<'a> {
 
         let logical_schema = df_logical_schema(
             self.snapshot,
-            &config.file_column_name,
-            &config.row_number_column,
+            &config,
             Some(schema.clone()),
+            self.projection,
         )?;
-
-        let logical_schema = if let Some(used_columns) = self.projection {
-            let mut fields = vec![];
-            for idx in used_columns {
-                fields.push(logical_schema.field(*idx).to_owned());
-            }
-            Arc::new(ArrowSchema::new(fields))
-        } else {
-            logical_schema
-        };
 
         let context = SessionContext::new();
         let df_schema = logical_schema.clone().to_dfschema()?;
@@ -645,18 +673,75 @@ impl<'a> DeltaScanBuilder<'a> {
                 .push(part);
         }
 
-        let mut fields = schema
-            .fields()
-            .iter()
-            .filter(|f| !table_partition_cols.contains(f.name()))
-            .cloned()
-            .collect::<Vec<arrow::datatypes::FieldRef>>();
-        if let Some(column_name) = config.row_number_column.as_ref() {
-            let field = Field::new(column_name.clone(), ArrowDataType::UInt64, false);
-            let field = Arc::new(field);
-            fields.push(field);
+        let mut row_number_column_name = config.row_number_column.clone();
+        if row_number_column_name.is_none() && config.deletion_vectors_enabled {
+            row_number_column_name = Some("__delta_row_number".to_string());
         }
+
+        let mut is_row_deleted_column = config.is_row_deleted_column.clone();
+        if is_row_deleted_column.is_none() && config.deletion_vectors_enabled {
+            is_row_deleted_column = Some("__delta_is_row_deleted".to_string());
+        }
+
+        let row_number_column = row_number_column_name
+            .as_ref()
+            .map(|column_name| Arc::new(Field::new(column_name, ArrowDataType::UInt64, false)));
+        let is_row_deleted_column = is_row_deleted_column
+            .as_ref()
+            .map(|column_name| Arc::new(Field::new(column_name, ArrowDataType::Boolean, false)));
+
+        let mut stats = self.snapshot.datafusion_table_statistics();
+        // Construct schema and statistics for the file scan
+        let mut fields = Vec::new();
+        let mut column_statistics = Vec::new();
+        // Note: Partition columns are always last in the schema. This is guaranteed by the way we read Delta tables
+        for (idx, field) in schema.fields().iter().enumerate() {
+            if table_partition_cols.contains(field.name()) {
+                continue;
+            }
+            fields.push(field.clone());
+            column_statistics.push(
+                stats
+                    .as_ref()
+                    .and_then(|stats| stats.column_statistics.get(idx))
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+        let mut partition_columns_index = fields.len();
+        let mut partition_columns_offset = 0;
+
+        if let Some(row_number_column) = &row_number_column {
+            fields.push(row_number_column.clone());
+            column_statistics.push(ColumnStatistics::new_unknown());
+            if config.row_number_column.is_none() {
+                partition_columns_offset += 1;
+            } else {
+                partition_columns_index += 1;
+            }
+        }
+        if let Some(is_row_deleted_column) = &is_row_deleted_column {
+            fields.push(is_row_deleted_column.clone());
+            column_statistics.push(ColumnStatistics::new_unknown());
+            if config.is_row_deleted_column.is_none() {
+                partition_columns_offset += 1;
+            } else {
+                partition_columns_index += 1;
+            }
+        }
+        // Since we have added non-partition columns we need to offset projections for partition columns
+        let mut projection = self.projection.cloned();
+        if let Some(projection) = projection.as_mut() {
+            projection.iter_mut().filter(|idx| **idx >= partition_columns_index)
+                .for_each(|idx| *idx += partition_columns_offset)
+        }
+
+        // TODO: Fixes a bug where stats has more columns than the schema when partition columns are present?
         let file_schema = Arc::new(ArrowSchema::new(fields));
+        if let Some(stats) = stats.as_mut() {
+            stats.column_statistics = column_statistics;
+        }
+        let stats = stats.unwrap_or_else(|| Statistics::new_unknown(&file_schema));
 
         let mut table_partition_cols = table_partition_cols
             .iter()
@@ -676,17 +761,6 @@ impl<'a> DeltaScanBuilder<'a> {
             ));
         }
 
-        let mut stats = self
-            .snapshot
-            .datafusion_table_statistics()
-            .unwrap_or(Statistics::new_unknown(&schema));
-
-        if config.row_number_column.is_some() {
-            stats
-                .column_statistics
-                .push(ColumnStatistics::new_unknown());
-        }
-
         let parquet_options = TableParquetOptions {
             global: self.session.config().options().execution.parquet.clone(),
             ..Default::default()
@@ -694,7 +768,7 @@ impl<'a> DeltaScanBuilder<'a> {
 
         let mut file_source = ParquetSource::new(parquet_options)
             .with_schema_adapter_factory(Arc::new(DeltaSchemaAdapterFactory {}))
-            .with_row_number_column(config.row_number_column.clone());
+            .with_row_number_column(row_number_column_name.clone());
 
         // Sometimes (i.e Merge) we want to prune files that don't make the
         // filter and read the entire contents for files that do match the
@@ -705,28 +779,113 @@ impl<'a> DeltaScanBuilder<'a> {
             }
         };
 
-        println!("file_schema={:#?}", file_schema);
-        println!("projection={:#?}", self.projection);
-        let file_scan_config = FileScanConfig::new(
-            self.log_store.object_store_url(),
-            file_schema,
-            Arc::new(file_source),
-        )
-        .with_file_groups(
-            // If all files were filtered out, we still need to emit at least one partition to
-            // pass datafusion sanity checks.
-            //
-            // See https://github.com/apache/datafusion/issues/11322
-            if file_groups.is_empty() {
-                vec![vec![]]
+        let file_source: Arc<dyn FileSource> =
+            if let (Some(row_number_column), Some(is_row_deleted_column)) =
+                (row_number_column.as_ref(), is_row_deleted_column.as_ref())
+            {
+                Arc::new(DeletionVectorFileSource::new(
+                    file_source,
+                    self.log_store.object_store(None),
+                    row_number_column.clone(),
+                    is_row_deleted_column.clone(),
+                ))
             } else {
-                file_groups.into_values().collect()
-            },
-        )
-        .with_statistics(stats)
-        .with_projection(self.projection.cloned())
-        .with_limit(self.limit)
-        .with_table_partition_cols(table_partition_cols);
+                Arc::new(file_source)
+            };
+
+        let mut file_scan_projection = projection;
+        if let Some(projection) = file_scan_projection.as_mut() {
+            let mut new_projection = Vec::new();
+            if let Some(row_number_column) = &row_number_column {
+                new_projection.push(file_schema.index_of(row_number_column.name()).ok());
+            }
+            if let Some(is_row_deleted_column) = &is_row_deleted_column {
+                new_projection.push(file_schema.index_of(is_row_deleted_column.name()).ok());
+            }
+            projection.extend(
+                new_projection
+                    .into_iter()
+                    .flatten()
+                    .filter(|x| !projection.contains(x))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        println!("schema-1={:#?}", file_schema);
+        println!("projection={:#?}", file_scan_projection);
+
+        let file_scan_config =
+            FileScanConfig::new(self.log_store.object_store_url(), file_schema, file_source)
+                .with_file_groups(
+                    // If all files were filtered out, we still need to emit at least one partition to
+                    // pass datafusion sanity checks.
+                    //
+                    // See https://github.com/apache/datafusion/issues/11322
+                    if file_groups.is_empty() {
+                        vec![vec![]]
+                    } else {
+                        file_groups.into_values().collect()
+                    },
+                )
+                .with_statistics(stats)
+                .with_projection(file_scan_projection)
+                .with_limit(self.limit)
+                .with_table_partition_cols(table_partition_cols);
+
+        let mut scan: Arc<dyn ExecutionPlan> = file_scan_config.build();
+
+        println!("schema0={:#?}", scan.schema());
+        let inner_df_schema = scan.schema().to_dfschema()?;
+        if let Some(is_row_deleted_column) = &is_row_deleted_column {
+            let filter_expr = col(is_row_deleted_column.name()).is_false();
+            let physical_expr =
+                create_physical_expr(&filter_expr, &inner_df_schema, &ExecutionProps::new())?;
+            scan = Arc::new(FilterExec::try_new(physical_expr, scan)?);
+        }
+        println!("schema1={:#?}", scan.schema());
+        // Project away unexposed columns
+        if config.deletion_vectors_enabled
+            && (config.row_number_column.is_none() || config.is_row_deleted_column.is_none())
+        {
+            let schema = scan.schema();
+            let indexes_to_remove = [
+                config
+                    .row_number_column
+                    .is_none()
+                    .then(|| row_number_column.as_ref()),
+                config
+                    .is_row_deleted_column
+                    .is_none()
+                    .then(|| is_row_deleted_column.as_ref()),
+            ]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|field| schema.index_of(field.name()).ok())
+            .flatten()
+            .collect::<Vec<_>>();
+
+            let mut current_projection = (0..scan.schema().fields().len())
+                .filter(|idx| !indexes_to_remove.contains(idx))
+                .collect::<Vec<usize>>();
+
+            let execution_props = &ExecutionProps::new();
+            let fields: DeltaResult<Vec<(Arc<dyn PhysicalExpr>, String)>> = current_projection
+                .iter()
+                .map(|i| {
+                    let (table_ref, field) = inner_df_schema.qualified_field(*i);
+                    create_physical_expr(
+                        &Expr::Column(Column::from((table_ref, field))),
+                        &inner_df_schema,
+                        execution_props,
+                    )
+                    .map(|expr| (expr, field.name().clone()))
+                    .map_err(DeltaTableError::from)
+                })
+                .collect();
+            scan = Arc::new(ProjectionExec::try_new(fields?, scan)?);
+        }
+
+        println!("schema2={:#?}", scan.schema());
 
         let metrics = ExecutionPlanMetricsSet::new();
         MetricBuilder::new(&metrics)
@@ -738,7 +897,7 @@ impl<'a> DeltaScanBuilder<'a> {
 
         Ok(DeltaScan {
             table_uri: ensure_table_uri(self.log_store.root_uri())?.as_str().into(),
-            parquet_scan: file_scan_config.build(),
+            scan,
             config,
             logical_schema,
             metrics,
@@ -822,12 +981,7 @@ impl DeltaTableProvider {
         config: DeltaScanConfig,
     ) -> DeltaResult<Self> {
         Ok(DeltaTableProvider {
-            schema: df_logical_schema(
-                &snapshot,
-                &config.file_column_name,
-                &config.row_number_column,
-                config.schema.clone(),
-            )?,
+            schema: df_logical_schema(&snapshot, &config, config.schema.clone(), None)?,
             snapshot,
             log_store,
             config,
@@ -1010,8 +1164,8 @@ pub struct DeltaScan {
     pub table_uri: String,
     /// Column that contains an index that maps to the original metadata Add
     pub config: DeltaScanConfig,
-    /// The parquet scan to wrap
-    pub parquet_scan: Arc<dyn ExecutionPlan>,
+    /// The scan to wrap
+    pub scan: Arc<dyn ExecutionPlan>,
     /// The schema of the table to be used when evaluating expressions
     pub logical_schema: Arc<ArrowSchema>,
     /// Metrics for scan reported via DataFusion
@@ -1041,15 +1195,15 @@ impl ExecutionPlan for DeltaScan {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.parquet_scan.schema()
+        self.scan.schema()
     }
 
     fn properties(&self) -> &PlanProperties {
-        self.parquet_scan.properties()
+        self.scan.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.parquet_scan]
+        vec![&self.scan]
     }
 
     fn with_new_children(
@@ -1065,7 +1219,7 @@ impl ExecutionPlan for DeltaScan {
         Ok(Arc::new(DeltaScan {
             table_uri: self.table_uri.clone(),
             config: self.config.clone(),
-            parquet_scan: children[0].clone(),
+            scan: children[0].clone(),
             logical_schema: self.logical_schema.clone(),
             metrics: self.metrics.clone(),
         }))
@@ -1076,7 +1230,7 @@ impl ExecutionPlan for DeltaScan {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        self.parquet_scan.execute(partition, context)
+        self.scan.execute(partition, context)
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -1084,7 +1238,7 @@ impl ExecutionPlan for DeltaScan {
     }
 
     fn statistics(&self) -> DataFusionResult<Statistics> {
-        self.parquet_scan.statistics()
+        self.scan.statistics()
     }
 
     fn repartitioned(
@@ -1092,11 +1246,11 @@ impl ExecutionPlan for DeltaScan {
         target_partitions: usize,
         config: &ConfigOptions,
     ) -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
-        if let Some(parquet_scan) = self.parquet_scan.repartitioned(target_partitions, config)? {
+        if let Some(parquet_scan) = self.scan.repartitioned(target_partitions, config)? {
             Ok(Some(Arc::new(DeltaScan {
                 table_uri: self.table_uri.clone(),
                 config: self.config.clone(),
-                parquet_scan,
+                scan: parquet_scan,
                 logical_schema: self.logical_schema.clone(),
                 metrics: self.metrics.clone(),
             })))
@@ -1200,6 +1354,11 @@ fn partitioned_file_from_action(
         })
         .collect::<Vec<_>>();
 
+    let deletion_vector = action
+        .deletion_vector
+        .clone()
+        .map(|descriptor| -> Arc<dyn Any + Send + Sync> { Arc::new(descriptor) });
+
     let ts_secs = action.modification_time / 1000;
     let ts_ns = (action.modification_time % 1000) * 1_000_000;
     let last_modified = Utc.from_utc_datetime(
@@ -1214,7 +1373,7 @@ fn partitioned_file_from_action(
         },
         partition_values,
         range: None,
-        extensions: None,
+        extensions: deletion_vector,
         statistics: None,
         metadata_size_hint: None,
     }
@@ -1521,7 +1680,7 @@ impl PhysicalExtensionCodec for DeltaPhysicalCodec {
             .map_err(|_| DataFusionError::Internal("Unable to decode DeltaScan".to_string()))?;
         let delta_scan = DeltaScan {
             table_uri: wire.table_uri,
-            parquet_scan: (*inputs)[0].clone(),
+            scan: (*inputs)[0].clone(),
             config: wire.config,
             logical_schema: wire.logical_schema,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -1758,12 +1917,8 @@ pub(crate) async fn find_files_scan(
     }
     .build(snapshot)?;
 
-    let logical_schema = df_logical_schema(
-        snapshot,
-        &scan_config.file_column_name,
-        &scan_config.row_number_column,
-        None,
-    )?;
+    let logical_schema =
+        df_logical_schema(snapshot, &scan_config, scan_config.schema.clone(), None)?;
 
     // Identify which columns we need to project
     let mut used_columns = expression
@@ -2290,7 +2445,7 @@ mod tests {
         ]));
         let exec_plan = Arc::from(DeltaScan {
             table_uri: "s3://my_bucket/this/is/some/path".to_string(),
-            parquet_scan: Arc::from(EmptyExec::new(schema.clone())),
+            scan: Arc::from(EmptyExec::new(schema.clone())),
             config: DeltaScanConfig::default(),
             logical_schema: schema.clone(),
             metrics: ExecutionPlanMetricsSet::new(),

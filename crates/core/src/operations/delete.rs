@@ -48,7 +48,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use parquet::file::properties::WriterProperties;
-use roaring::{RoaringBitmap, RoaringTreemap};
+use roaring::RoaringTreemap;
 use serde::Serialize;
 
 use super::cdc::should_write_cdc;
@@ -67,6 +67,7 @@ use crate::errors::DeltaResult;
 use crate::kernel::arrow::extract::ProvidesColumnByName;
 use crate::kernel::{Action, Add, DeletionVectorDescriptor, Remove, StorageType};
 use crate::logstore::LogStoreRef;
+use crate::operations::deletion_vectors::write_deletion_vectors_file;
 use crate::operations::write::execution::{write_execution_plan, write_execution_plan_cdc};
 use crate::operations::write::WriterStatsConfig;
 use crate::operations::CustomExecuteHandler;
@@ -340,6 +341,7 @@ async fn execute_deletion_vectors(
     let scan_config = DeltaScanConfigBuilder::default()
         .with_file_column(true)
         .with_row_number_column(Some(ROW_NUMBER_COLUMN.to_string()))
+        .with_deletion_vectors(true)
         .with_schema(snapshot.input_schema()?)
         .build(snapshot)?;
 
@@ -348,10 +350,6 @@ async fn execute_deletion_vectors(
             .with_files(rewrite.to_vec()),
     );
     use datafusion::datasource::TableProvider;
-    println!(
-        "delete.arget_provider_schema: {:#?}",
-        target_provider.schema()
-    );
     let target_provider = provider_as_source(target_provider);
     let source = LogicalPlanBuilder::scan("target", target_provider.clone(), None)?.build()?;
 
@@ -376,13 +374,11 @@ async fn execute_deletion_vectors(
     // Apply the filter and rewrite files
     let filter_expression = Expr::IsTrue(Box::new(expression.clone()));
 
-    println!("here1");
     let filter = df
         .clone()
         .filter(filter_expression)?
         .create_physical_plan()
         .await?;
-    println!("here2");
     let add_actions: Vec<Action> = deletion_vectors_execution_plan(
         snapshot,
         state.clone(),
@@ -419,20 +415,18 @@ async fn execute_deletion_vectors(
     Ok(actions)
 }
 
-type DeletionVectorMap = HashMap<String, RoaringBitmap>;
+type DeletionVectorMap = HashMap<String, RoaringTreemap>;
 
 /// In-memory writer for deletion vectors
 struct DeletionVectorWriter {
-    object_store: ObjectStoreRef,
     deletion_vectors: DeletionVectorMap,
 }
 
 const ROW_NUMBER_COLUMN: &str = "__delta_rs_row_number";
 
 impl DeletionVectorWriter {
-    fn new(object_store: ObjectStoreRef) -> Self {
+    fn new() -> Self {
         Self {
-            object_store,
             deletion_vectors: Default::default(),
         }
     }
@@ -450,19 +444,18 @@ impl DeletionVectorWriter {
         let file_dictionary = get_path_column(&batch, PATH_COLUMN)?;
         let mut file_names = file_dictionary.into_iter();
         let mut row_numbers = row_numbers.iter();
-        let mut groups: HashMap<&str, Vec<u32>> = HashMap::new();
+        let mut groups: HashMap<&str, Vec<u64>> = HashMap::new();
         while let (Some(row_number), Some(file_name)) = (row_numbers.next(), file_names.next()) {
-            // TODO: Check u32
-            groups
+            groups // TODO: Check unwraps
                 .entry(file_name.unwrap())
-                .or_insert_with(Vec::new)
-                .push(row_number.unwrap() as u32);
+                .or_default()
+                .push(row_number.unwrap());
         }
         for (file_name, row_numbers) in groups {
             // TODO: Avoid to_string
             self.deletion_vectors
                 .entry(file_name.to_string())
-                .or_insert_with(RoaringBitmap::new)
+                .or_default()
                 .extend(row_numbers);
         }
         Ok(())
@@ -486,7 +479,7 @@ async fn deletion_vectors_execution_plan(
         let task_ctx = Arc::new(TaskContext::from(&state));
         let mut stream = inner_plan.execute(i, task_ctx)?;
 
-        let mut writer = DeletionVectorWriter::new(object_store.clone());
+        let mut writer = DeletionVectorWriter::new();
 
         let handle: tokio::task::JoinHandle<DeltaResult<DeletionVectorMap>> =
             tokio::task::spawn(async move {
@@ -518,11 +511,16 @@ async fn deletion_vectors_execution_plan(
         return Ok(vec![]);
     };
 
-    // TODO: Add read support
-    // TODO: Test with partition columns
+    // TODO: Test parquet predicate pushdown
+    // TODO: Test with explicit schema in scan config
+    // TODO: Test with None projection
+    // TODO: Report error with potentially broken statistics?
+    // TODO: Refactor such that we do a union of execution for files with deletion vectors and without
     // TODO: Merge with existing deletion vectors if they exist. That is, make an initial pass over touched files, read their deletion vectors (in parallel) and merge them with the new deletion vectors.
+    // TODO: Test multiple ways of reading and writing deletion vectors
+    // TODO: Test reading deletion vectors produced by Spark. Multiple scenarios
+    // TODO: Handle absolute path deletion vectors
     // Write deletion vector files
-    println!("deletion_vectors: {:#?}", deletion_vectors);
     let deletion_vector_descriptors =
         write_deletion_vectors_object_store(object_store, deletion_vectors).await?;
     let mut actions = vec![];
@@ -552,85 +550,7 @@ async fn write_deletion_vectors_object_store(
     object_store
         .put(&path, PutPayload::from_bytes(bytes))
         .await?;
-    println!("writing deletion vecotr to: {:?}", path);
     Ok(result)
-}
-
-const DELETION_VECTOR_MAGIC: [u8; 4] = 1681511377u32.to_be_bytes();
-const DELETION_VECTOR_FILE_FORMAT_VERSION_1: u8 = 1;
-
-mod size {
-    pub const VERSION: usize = 1;
-    pub const DATA_SIZE: usize = 4;
-    pub const MAGIC: usize = 4;
-    pub const CHECKSUM: usize = 4;
-}
-
-fn write_deletion_vectors_file<I>(
-    uuid: &Uuid,
-    deletion_vectors: I,
-) -> DeltaResult<(HashMap<String, DeletionVectorDescriptor>, Bytes)>
-where
-    for<'a> &'a I: IntoIterator<Item = (&'a String, &'a RoaringBitmap)>,
-    I: IntoIterator<Item = (String, RoaringBitmap)>,
-{
-    // We use UUID relative paths for deletion vectors (like the Spark implementation).
-    // Protocol definition at: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vector-format
-    // Spark reference implementation: https://github.com/delta-io/delta/blob/e7581526e3b7235621c2f4973c799e2f144350cf/spark/src/main/scala/org/apache/spark/sql/delta/storage/dv/DeletionVectorStore.scala#L213-L245
-    let mut result = HashMap::new();
-    let buffer_size = size::VERSION
-        + (&deletion_vectors)
-            .into_iter()
-            .map(|(_, v)| size::DATA_SIZE + size::MAGIC + v.serialized_size() + size::CHECKSUM)
-            .sum::<usize>();
-    let mut buffer = BytesMut::with_capacity(buffer_size);
-    buffer.put_u8(DELETION_VECTOR_FILE_FORMAT_VERSION_1);
-    for (file_name, deletion_vector) in deletion_vectors.into_iter() {
-        let PartialDeletionVectorDescriptor {
-            offset,
-            size_in_bytes,
-            cardinality,
-        } = write_deletion_vector(&mut buffer, &deletion_vector)?;
-        let path_or_inline_dv = z85::encode(uuid.as_bytes());
-        result.insert(
-            file_name,
-            DeletionVectorDescriptor {
-                storage_type: StorageType::UuidRelativePath,
-                path_or_inline_dv,
-                offset: Some(offset),
-                size_in_bytes,
-                cardinality,
-            },
-        );
-    }
-    Ok((result, buffer.freeze()))
-}
-
-struct PartialDeletionVectorDescriptor {
-    offset: i32,
-    size_in_bytes: i32,
-    cardinality: i64,
-}
-
-fn write_deletion_vector(
-    buffer: &mut BytesMut,
-    deletion_vector: &RoaringBitmap,
-) -> io::Result<PartialDeletionVectorDescriptor> {
-    let offset = buffer.len();
-    let cardinality = deletion_vector.len() as i64;
-    let size_in_bytes = size::MAGIC + deletion_vector.serialized_size();
-    buffer.put_u32(size_in_bytes as u32);
-    buffer.put_slice(&DELETION_VECTOR_MAGIC);
-    deletion_vector.serialize_into(buffer.writer())?;
-    let checksum = crc32fast::hash(
-        &buffer[offset + size::DATA_SIZE..offset + size::DATA_SIZE + size_in_bytes],
-    );
-    buffer.put_u32(checksum);
-    Ok(PartialDeletionVectorDescriptor {
-        offset: offset as i32,
-        cardinality,
-        size_in_bytes: size_in_bytes as i32,
-    })
 }
 
 async fn write_cdc(
@@ -661,7 +581,7 @@ async fn write_cdc(
             .create_physical_plan()
             .await?;
 
-        return Ok(write_execution_plan_cdc(
+        return write_execution_plan_cdc(
             Some(snapshot),
             state.clone(),
             cdc_filter,
@@ -672,9 +592,9 @@ async fn write_cdc(
             writer_properties,
             writer_stats_config,
         )
-        .await?);
+        .await;
     }
-    return Ok(vec![]);
+    Ok(vec![])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -701,7 +621,6 @@ async fn execute(
     metrics.scan_time_ms = Instant::now().duration_since(scan_start).as_millis() as u64;
 
     let predicate = predicate.unwrap_or(Expr::Literal(ScalarValue::Boolean(Some(true))));
-
     let mut actions = {
         let write_start = Instant::now();
         let add = if !deletion_vectors {
@@ -849,12 +768,11 @@ impl std::future::IntoFuture for DeleteBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::delta_datafusion::DeltaScanConfigBuilder;
     use crate::delta_datafusion::DeltaTableProvider;
+    use crate::delta_datafusion::{DeltaScanConfig, DeltaScanConfigBuilder};
     use crate::kernel::{DataType as DeltaDataType, StorageType};
     use crate::operations::collect_sendable_stream;
     use crate::operations::delete::DeletionVectorDescriptor;
-    use crate::operations::delete::{write_deletion_vector, write_deletion_vectors_file};
     use crate::operations::DeltaOps;
     use crate::protocol::*;
     use crate::writer::test_utils::datafusion::get_data;
@@ -865,6 +783,7 @@ mod tests {
     use crate::DeltaTable;
     use crate::TableProperty;
     use arrow::array::Array;
+    use arrow::array::AsArray;
     use arrow::array::Int32Array;
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -875,21 +794,17 @@ mod tests {
     use arrow_schema::DataType;
     use arrow_schema::Fields;
     use bytes::BufMut;
-    use bytes::BytesMut;
     use datafusion::assert_batches_sorted_eq;
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::*;
     use delta_kernel::schema::PrimitiveType;
     use futures::TryStreamExt;
-    use roaring::RoaringBitmap;
+    use object_store::path::Path;
+    use object_store::ObjectStore;
     use serde_json::json;
-    use std::collections::{BTreeMap, HashMap};
     use std::io::Write;
     use std::sync::Arc;
-    use uuid::Uuid;
-    use arrow::array::AsArray;
-    use object_store::ObjectStore;
-    use object_store::path::Path;
+    use arrow_array::types::{UInt16Type, UInt64Type};
     use url::Url;
 
     async fn setup_table(partitions: Option<Vec<&str>>) -> DeltaTable {
@@ -936,7 +851,7 @@ mod tests {
                 ])),
             ],
         )
-            .unwrap();
+        .unwrap();
         // write some data
         let table = DeltaOps(table)
             .write(vec![batch.clone()])
@@ -994,7 +909,7 @@ mod tests {
                 ])),
             ],
         )
-            .unwrap();
+        .unwrap();
 
         // write some data
         let table = DeltaOps(table)
@@ -1018,7 +933,7 @@ mod tests {
                 ])),
             ],
         )
-            .unwrap();
+        .unwrap();
 
         // write some data
         let table = DeltaOps(table)
@@ -1087,7 +1002,7 @@ mod tests {
                     Some(4),
                 ]))],
             )
-                .unwrap();
+            .unwrap();
 
             DeltaOps::new_in_memory().write(vec![batch]).await.unwrap()
         }
@@ -1174,7 +1089,7 @@ mod tests {
                 ])),
             ],
         )
-            .unwrap();
+        .unwrap();
 
         // write some data
         let table = DeltaOps(table)
@@ -1231,7 +1146,7 @@ mod tests {
                 ])),
             ],
         )
-            .unwrap();
+        .unwrap();
 
         // write some data
         let table = DeltaOps(table)
@@ -1366,7 +1281,7 @@ mod tests {
             Arc::clone(&schema),
             vec![Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3)]))],
         )
-            .unwrap();
+        .unwrap();
         let table = DeltaOps(table)
             .write(vec![batch])
             .await
@@ -1393,8 +1308,8 @@ mod tests {
             table,
             ctx,
         )
-            .await
-            .expect("Failed to collect batches");
+        .await
+        .expect("Failed to collect batches");
 
         // The batches will contain a current _commit_timestamp which shouldn't be check_append_only
         let _: Vec<_> = batches.iter_mut().map(|b| b.remove_column(3)).collect();
@@ -1449,7 +1364,7 @@ mod tests {
                 Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3)])),
             ],
         )
-            .unwrap();
+        .unwrap();
 
         let table = DeltaOps(table)
             .write(vec![batch])
@@ -1477,8 +1392,8 @@ mod tests {
             table,
             ctx,
         )
-            .await
-            .expect("Failed to collect batches");
+        .await
+        .expect("Failed to collect batches");
 
         // The batches will contain a current _commit_timestamp which shouldn't be check_append_only
         let _: Vec<_> = batches.iter_mut().map(|b| b.remove_column(4)).collect();
@@ -1509,64 +1424,35 @@ mod tests {
         Ok(batches)
     }
 
-    #[test]
-    fn test_write_deletion_vectors_file() {
-        use roaring::RoaringBitmap;
-        let uuid = Uuid::from_u128(1);
-        let (result, bytes) = write_deletion_vectors_file(
-            &uuid,
-            BTreeMap::from_iter([
-                (
-                    "file1.parquet".to_string(),
-                    RoaringBitmap::from_iter(vec![1, 2, 3]),
-                ),
-                (
-                    "file2.parquet".to_string(),
-                    RoaringBitmap::from_iter(vec![4, 5, 6]),
-                ),
-            ]),
+    async fn read_from_test_table(table: &DeltaTable, sql: impl AsRef<str>) -> Vec<RecordBatch> {
+        read_from_test_table_with_config_builder(table, DeltaScanConfigBuilder::default(), sql)
+            .await
+    }
+
+    async fn read_from_test_table_with_config_builder(
+        table: &DeltaTable,
+        builder: DeltaScanConfigBuilder,
+        sql: impl AsRef<str>,
+    ) -> Vec<RecordBatch> {
+        let config = builder
+            .with_deletion_vectors(true)
+            .build(table.snapshot().unwrap())
+            .unwrap();
+        let provider = DeltaTableProvider::try_new(
+            table.snapshot().unwrap().clone(),
+            table.log_store(),
+            config,
         )
-            .expect("Failed to write deletion vectors file");
-        assert_eq!(result.len(), 2);
-        assert_eq!(bytes.len(), 69);
+        .unwrap();
 
-        let file1 = result.get("file1.parquet").unwrap();
-        assert_eq!(
-            file1,
-            &DeletionVectorDescriptor {
-                storage_type: StorageType::UuidRelativePath,
-                path_or_inline_dv: z85::encode(uuid.as_bytes()),
-                offset: Some(1),
-                size_in_bytes: 26,
-                cardinality: 3,
-            }
-        );
-        let file2 = result.get("file2.parquet").unwrap();
-        assert_eq!(
-            file2,
-            &DeletionVectorDescriptor {
-                storage_type: StorageType::UuidRelativePath,
-                path_or_inline_dv: z85::encode(uuid.as_bytes()),
-                offset: Some(35),
-                size_in_bytes: 26,
-                cardinality: 3,
-            }
-        );
+        let ctx = SessionContext::new();
+        ctx.register_table("test", Arc::new(provider)).unwrap();
+        let state = ctx.state();
+        let df = ctx.sql(sql.as_ref()).await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let mut stream = plan.execute(0, state.task_ctx()).unwrap();
+        stream.try_collect().await.expect("Failed to collect")
     }
-
-    #[test]
-    fn test_write_one_deletion_vector() {
-        let mut buffer = BytesMut::new();
-        let result = write_deletion_vector(&mut buffer, &RoaringBitmap::from_iter(vec![1, 2, 3]))
-            .expect("Failed to write deletion vector");
-        assert_eq!(result.offset, 0);
-        assert_eq!(result.size_in_bytes, 26);
-        assert_eq!(result.cardinality, 3);
-        assert_eq!(buffer.len(), 34);
-    }
-
-    #[test]
-    fn test_read_deletion_vector_file() {}
 
     #[tokio::test]
     async fn test_delete_with_deletion_vectors() {
@@ -1584,7 +1470,10 @@ mod tests {
         assert_eq!(table.get_files_count(), 1);
 
         let snapshot = table.snapshot().expect("Failed to get snapshot");
-        let mut adds = snapshot.file_actions_iter().expect("Failed to get file actions").collect::<Vec<_>>();
+        let mut adds = snapshot
+            .file_actions_iter()
+            .expect("Failed to get file actions")
+            .collect::<Vec<_>>();
         assert_eq!(adds.len(), 1);
         let original_add_action = adds.pop().unwrap();
 
@@ -1604,55 +1493,299 @@ mod tests {
         assert_eq!(metrics.num_copied_rows, 1);
 
         let snapshot = table.snapshot().expect("Failed to get snapshot");
-        let mut adds = snapshot.file_actions_iter().expect("Failed to get file actions").collect::<Vec<_>>();
+        let mut adds = snapshot
+            .file_actions_iter()
+            .expect("Failed to get file actions")
+            .collect::<Vec<_>>();
         assert_eq!(adds.len(), 1);
         let mut new_add_action = adds.pop().unwrap();
-        let deletion_vector = new_add_action.deletion_vector.take().expect("No deletion vector");
+        let deletion_vector = new_add_action
+            .deletion_vector
+            .take()
+            .expect("No deletion vector");
         assert_eq!(original_add_action, new_add_action);
-        assert_eq!(deletion_vector, DeletionVectorDescriptor {
-            storage_type: StorageType::UuidRelativePath,
-            path_or_inline_dv: deletion_vector.path_or_inline_dv.clone(),
-            offset: Some(1),
-            size_in_bytes: 22,
-            cardinality: 1,
-        });
+        assert_eq!(
+            deletion_vector,
+            DeletionVectorDescriptor {
+                storage_type: StorageType::UuidRelativePath,
+                path_or_inline_dv: deletion_vector.path_or_inline_dv.clone(),
+                offset: Some(1),
+                size_in_bytes: 34,
+                cardinality: 1,
+            }
+        );
 
         let root = Url::parse(&table.log_store().root_uri()).expect("Failed to parse URL");
-        let deletion_vector_uri = deletion_vector.absolute_path(&root).expect("Failed to get absolute path").expect("No absolute path");
+        let deletion_vector_uri = deletion_vector
+            .absolute_path(&root)
+            .expect("Failed to get absolute path")
+            .expect("No absolute path");
         let deletion_vector_path = Path::from(deletion_vector_uri.path());
-        let deletion_vector = table.object_store().get(&deletion_vector_path).await.expect("Failed to get object");
-        assert_eq!(deletion_vector.meta.size, 31);
+        let deletion_vector = table
+            .object_store()
+            .get(&deletion_vector_path)
+            .await
+            .expect("Failed to get object");
+        assert_eq!(deletion_vector.meta.size, 43);
 
+        let batches = read_from_test_table(&table, "select value from test").await;
+        assert_eq!(1, batches.len());
+        let batch = &batches[0];
+        assert_eq!(2, batch.num_rows());
 
-        // let config = DeltaScanConfigBuilder::new()
-        //     .build(table.snapshot().unwrap())
-        //     .unwrap();
-        // let provider = DeltaTableProvider::try_new(
-        //     table.snapshot().unwrap().clone(),
-        //     table.log_store(),
-        //     config,
-        // )
-        // .unwrap();
-        //
-        // let ctx = SessionContext::new();
-        // ctx.register_table("test", Arc::new(provider)).unwrap();
-        // let state = ctx.state();
-        // let df = ctx.sql("select value from test").await.unwrap();
-        // let plan = df.create_physical_plan().await.unwrap();
-        //
-        // let mut stream = plan.execute(0, state.task_ctx()).unwrap();
-        // let batches: Vec<RecordBatch> = stream.try_collect().await.expect("Failed to collect");
-        // assert_eq!(1, batches.len());
-        // let batch = &batches[0];
-        // assert_eq!(2, batch.num_rows());
-        //
-        // let value = batch.column_by_name("value").unwrap().as_string::<i32>();
-        // let values = value.iter().collect::<Vec<_>>();
-        // assert_eq!(values, vec![Some("2"), Some("3")]);
+        let value = batch.column_by_name("value").unwrap().as_string::<i32>();
+        let values = value.iter().collect::<Vec<_>>();
+        assert_eq!(values, vec![Some("2"), Some("3")]);
+    }
+    async fn case(sql: &str, expected_data: Vec<Vec<&str>>) {
+        case_with_config(sql, expected_data, Default::default()).await
+    }
+
+    async fn case_with_config(
+        sql: &str,
+        expected_data: Vec<Vec<&str>>,
+        scan_config_builder: DeltaScanConfigBuilder,
+    ) {
+        // Create table
+        let values: Arc<dyn Array> = Arc::new(arrow::array::StringArray::from(vec!["1", "2", "3"]));
+        let garbage: Arc<dyn Array> = Arc::new(arrow::array::StringArray::from(vec!["garbage", "garbage", "garbage"]));
+        let partition1: Arc<dyn Array> =
+            Arc::new(arrow::array::StringArray::from(vec!["a", "a", "a"]));
+        let partition2: Arc<dyn Array> =
+            Arc::new(arrow::array::StringArray::from(vec!["b", "b", "b"]));
+
+        let batch = RecordBatch::try_from_iter(vec![
+            ("partition1", partition1),
+            ("garbage1", garbage.clone()), // Add garbage columns to avoid accidental test success even if we mess up projection logic
+            ("value", values),
+            ("garbage2", garbage.clone()),
+            ("garbage3", garbage.clone()),
+            ("partition2", partition2),
+            ("garbage4", garbage.clone()),
+            ("garbage5", garbage.clone()),
+        ])
+        .unwrap();
+        let schema = batch.schema();
+
+        // write some data
+        let table = DeltaOps::new_in_memory()
+            .write(vec![batch.clone()])
+            .with_partition_columns(vec!["partition1", "partition2"])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+
+        let mut adds = table
+            .snapshot()
+            .unwrap()
+            .file_actions_iter()
+            .expect("Failed to get file actions")
+            .collect::<Vec<_>>();
+        let file_name = adds[0].path.as_str();
+
+        // Delete data from table
+        let (table, metrics) = DeltaOps(table)
+            .delete()
+            .with_predicate(col("value").eq(lit(2)))
+            .with_deletion_vectors(true)
+            .await
+            .unwrap();
+        // Test possible permutations of reading data from table
+
+        let batches =
+            read_from_test_table_with_config_builder(&table, scan_config_builder, sql).await;
+
+        let batch = batches.first().unwrap();
+        let actual_data = batch
+            .columns()
+            .into_iter()
+            .map(|column| {
+                match column.data_type() {
+                    DataType::Utf8 => {
+                        column
+                            .as_string::<i32>()
+                            .iter()
+                            .map(Option::unwrap)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    }
+                    DataType::Dictionary(_, _) => {
+                        column.as_dictionary::<UInt16Type>()
+                            .downcast_dict::<StringArray>()
+                            .unwrap()
+                            .into_iter()
+                            .map(Option::unwrap)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    }
+                    DataType::UInt64 => {
+                        column.as_primitive::<UInt64Type>()
+                            .into_iter()
+                            .map(Option::unwrap)
+                            .map(|x| x.to_string())
+                            .collect::<Vec<_>>()
+                    }
+                    _ => panic!("Unsupported type {}", column.data_type())
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let expected_data = expected_data.into_iter().map(|data| {
+            data.into_iter()
+                .map(|x| x.replace("file_name", file_name))
+                .collect::<Vec<_>>()
+        }).collect::<Vec<_>>();
+        assert_eq!(actual_data, expected_data);
     }
 
     #[tokio::test]
-    async fn test_read_table_with_deletion_vectors() {
+    async fn test_value() {
+        case("select value from test", vec![vec!["1", "3"]]).await;
+    }
 
+    #[tokio::test]
+    async fn test_partition1_value() {
+        case(
+            "select partition1, value from test",
+            vec![vec!["a", "a"], vec!["1", "3"]],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_partition1() {
+        case(
+            "select partition1 from test",
+            vec![vec!["a", "a"]],
+        )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_value_partition2() {
+        case(
+            "select value, partition2 from test",
+            vec![vec!["1", "3"], vec!["b", "b"]],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_partition2_value() {
+        case(
+            "select partition2, value from test",
+            vec![vec!["b", "b"], vec!["1", "3"]],
+        )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_value_partition1_partition2() {
+        case(
+            "select value, partition2, partition1 from test",
+            vec![vec!["1", "3"], vec!["b", "b"], vec!["a", "a"]],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_partition2_partition1() {
+        case(
+            "select partition2, partition1 from test",
+            vec![vec!["b", "b"], vec!["a", "a"]],
+        )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_value_row_number() {
+        case_with_config(
+            "select value, row_number from test",
+            vec![vec!["1", "3"], vec!["0", "2"]],
+            DeltaScanConfigBuilder::new().with_row_number_column(Some("row_number".to_string())),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_row_number() {
+        case_with_config(
+            "select row_number from test",
+            vec![vec!["0", "2"]],
+            DeltaScanConfigBuilder::new().with_row_number_column(Some("row_number".to_string())),
+        )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_partition1_row_number_value() {
+        case_with_config(
+            "select partition1, row_number, value from test",
+            vec![vec!["a", "a"], vec!["0", "2"], vec!["1", "3"]],
+            DeltaScanConfigBuilder::new().with_row_number_column(Some("row_number".to_string())),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_value_file_name() {
+        case_with_config(
+            "select value, file_name from test",
+            vec![vec!["1", "3"], vec!["file_name", "file_name"]],
+            DeltaScanConfigBuilder::new().with_file_column_name(&"file_name"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_file_name() {
+        case_with_config(
+            "select file_name from test",
+            vec![vec!["file_name", "file_name"]],
+            DeltaScanConfigBuilder::new().with_file_column_name(&"file_name"),
+        )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_value_file_name_partition1() {
+        case_with_config(
+            "select value, file_name, partition1 from test",
+            vec![vec!["1", "3"], vec!["file_name", "file_name"], vec!["a", "a"]],
+            DeltaScanConfigBuilder::new().with_file_column_name(&"file_name"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_partition2_file_name_value() {
+        case_with_config(
+            "select partition2, file_name, value from test",
+            vec![vec!["b", "b"], vec!["file_name", "file_name"], vec!["1", "3"]],
+            DeltaScanConfigBuilder::new().with_file_column_name(&"file_name"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_partition2_file_name() {
+        case_with_config(
+            "select partition2, file_name from test",
+            vec![vec!["b", "b"], vec!["file_name", "file_name"]],
+            DeltaScanConfigBuilder::new().with_file_column_name(&"file_name"),
+        )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_partition2_file_name_value_row_number() {
+        let file_name = "hello world";
+        case_with_config(
+            "select partition2, file_name, value, row_number from test",
+            vec![vec!["b", "b"],vec!["file_name", "file_name"], vec!["1", "3"], vec!["0", "2"]],
+            DeltaScanConfigBuilder::new()
+                .with_row_number_column(Some("row_number".to_string()))
+                .with_file_column_name(&"file_name"),
+        ).await;
     }
 }
