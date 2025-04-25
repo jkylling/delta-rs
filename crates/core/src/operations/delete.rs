@@ -391,14 +391,10 @@ async fn execute_deletion_vectors(
 
     actions.extend(add_actions);
 
-    let source_count = find_metric_node(SOURCE_COUNT_ID, &filter)
-        .ok_or_else(|| DeltaTableError::Generic("Unable to locate expected metric node".into()))?;
-    let source_count_metrics = source_count.metrics().unwrap();
-    let read_records = get_metric(&source_count_metrics, SOURCE_COUNT_METRIC);
     let filter_records = filter.metrics().and_then(|m| m.output_rows()).unwrap_or(0);
 
-    metrics.num_copied_rows = filter_records;
-    metrics.num_deleted_rows = read_records - filter_records;
+    metrics.num_copied_rows = 0;
+    metrics.num_deleted_rows = filter_records;
 
     actions.extend(
         write_cdc(
@@ -623,7 +619,7 @@ async fn execute(
     let mut actions = {
         let write_start = Instant::now();
         let add = if !deletion_vectors {
-            execute_non_empty_expr(
+            let mut actions = execute_non_empty_expr(
                 &snapshot,
                 log_store.clone(),
                 &state,
@@ -634,7 +630,27 @@ async fn execute(
                 candidates.partition_scan,
                 operation_id,
             )
-            .await?
+            .await?;
+            let deletion_timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            let remove = candidates.candidates;
+            for action in remove {
+                actions.push(Action::Remove(Remove {
+                    path: action.path,
+                    deletion_timestamp: Some(deletion_timestamp),
+                    data_change: true,
+                    extended_file_metadata: Some(true),
+                    partition_values: Some(action.partition_values),
+                    size: Some(action.size),
+                    deletion_vector: action.deletion_vector,
+                    tags: None,
+                    base_row_id: action.base_row_id,
+                    default_row_commit_version: action.default_row_commit_version,
+                }))
+            }
+            actions
         } else if deletion_vectors && !candidates.partition_scan {
             execute_deletion_vectors(
                 &snapshot,
@@ -654,31 +670,15 @@ async fn execute(
         metrics.rewrite_time_ms = Instant::now().duration_since(write_start).as_millis() as u64;
         add
     };
-    let remove = candidates.candidates;
 
-    let deletion_timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-
-    metrics.num_removed_files = remove.len();
-    metrics.num_added_files = actions.len();
-
-    // TODO: Is it always correct to remove all candidates?
-    for action in remove {
-        actions.push(Action::Remove(Remove {
-            path: action.path,
-            deletion_timestamp: Some(deletion_timestamp),
-            data_change: true,
-            extended_file_metadata: Some(true),
-            partition_values: Some(action.partition_values),
-            size: Some(action.size),
-            deletion_vector: action.deletion_vector,
-            tags: None,
-            base_row_id: action.base_row_id,
-            default_row_commit_version: action.default_row_commit_version,
-        }))
-    }
+    metrics.num_removed_files = actions
+        .iter()
+        .filter(|add| matches!(add, Action::Remove(_)))
+        .count();
+    metrics.num_added_files = actions
+        .iter()
+        .filter(|add| matches!(add, Action::Add(_)))
+        .count();
 
     metrics.execution_time_ms = Instant::now().duration_since(exec_start).as_millis() as u64;
 
@@ -1486,11 +1486,10 @@ mod tests {
 
         assert_eq!(table.version(), 1);
         assert_eq!(table.get_files_count(), 1);
-        // TODO: Metrics are incorrect
-        assert_eq!(metrics.num_added_files, 2);
+        assert_eq!(metrics.num_added_files, 1);
         assert_eq!(metrics.num_removed_files, 1);
-        assert_eq!(metrics.num_deleted_rows, 2);
-        assert_eq!(metrics.num_copied_rows, 1);
+        assert_eq!(metrics.num_deleted_rows, 1);
+        assert_eq!(metrics.num_copied_rows, 0);
 
         let snapshot = table.snapshot().expect("Failed to get snapshot");
         let mut adds = snapshot
