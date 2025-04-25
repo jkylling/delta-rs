@@ -732,7 +732,9 @@ impl<'a> DeltaScanBuilder<'a> {
         // Since we have added non-partition columns we need to offset projections for partition columns
         let mut projection = self.projection.cloned();
         if let Some(projection) = projection.as_mut() {
-            projection.iter_mut().filter(|idx| **idx >= partition_columns_index)
+            projection
+                .iter_mut()
+                .filter(|idx| **idx >= partition_columns_index)
                 .for_each(|idx| *idx += partition_columns_offset)
         }
 

@@ -76,6 +76,21 @@ use crate::storage::ObjectStoreRef;
 use crate::table::state::DeltaTableState;
 use crate::{DeltaTable, DeltaTableError};
 
+// TODO: Merge with existing deletion vectors if they exist. That is, make an initial pass over touched files, read their deletion vectors (in parallel) and merge them with the new deletion vectors.
+// TODO: Test multiple ways of reading and writing deletion vectors
+// TODO: Ensure reading of deletion vectors always happens in "executors"
+// TODO: Fuzz tests
+// TODO: Test parquet predicate pushdown
+// TODO: Test with explicit schema in scan config
+// TODO: Test with None projection
+// TODO: Report error with potentially broken statistics?
+// TODO: Refactor such that we do a union of execution for files with deletion vectors and without
+// TODO: Handle or ban absolute path deletion vectors
+// TODO: Fix outstanding TODOs
+// TODO: Clean up and produce minimal diff
+// TODO: Test with larger table
+// TODO: Draft PR description and explanation.
+
 const SOURCE_COUNT_ID: &str = "delete_source_count";
 const SOURCE_COUNT_METRIC: &str = "num_source_rows";
 
@@ -507,15 +522,6 @@ async fn deletion_vectors_execution_plan(
         return Ok(vec![]);
     };
 
-    // TODO: Test parquet predicate pushdown
-    // TODO: Test with explicit schema in scan config
-    // TODO: Test with None projection
-    // TODO: Report error with potentially broken statistics?
-    // TODO: Refactor such that we do a union of execution for files with deletion vectors and without
-    // TODO: Merge with existing deletion vectors if they exist. That is, make an initial pass over touched files, read their deletion vectors (in parallel) and merge them with the new deletion vectors.
-    // TODO: Test multiple ways of reading and writing deletion vectors
-    // TODO: Handle or ban absolute path deletion vectors
-    // Write deletion vector files
     let deletion_vector_descriptors =
         write_deletion_vectors_object_store(object_store, deletion_vectors).await?;
     let mut actions = vec![];
@@ -779,13 +785,14 @@ mod tests {
     use crate::writer::test_utils::{
         get_arrow_schema, get_delta_schema, get_record_batch, setup_table_with_configuration,
     };
-    use crate::{DeltaTable, DeltaTableBuilder};
     use crate::TableProperty;
+    use crate::{DeltaTable, DeltaTableBuilder};
     use arrow::array::Array;
     use arrow::array::AsArray;
     use arrow::array::Int32Array;
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use arrow_array::types::{Int32Type, UInt16Type, UInt64Type};
     use arrow_array::ArrayRef;
     use arrow_array::StringArray;
     use arrow_array::StructArray;
@@ -804,7 +811,6 @@ mod tests {
     use std::io::Write;
     use std::path::{absolute, PathBuf};
     use std::sync::Arc;
-    use arrow_array::types::{Int32Type, UInt16Type, UInt64Type};
     use url::Url;
 
     async fn setup_table(partitions: Option<Vec<&str>>) -> DeltaTable {
@@ -1547,7 +1553,9 @@ mod tests {
     ) {
         // Create table
         let values: Arc<dyn Array> = Arc::new(arrow::array::StringArray::from(vec!["1", "2", "3"]));
-        let garbage: Arc<dyn Array> = Arc::new(arrow::array::StringArray::from(vec!["garbage", "garbage", "garbage"]));
+        let garbage: Arc<dyn Array> = Arc::new(arrow::array::StringArray::from(vec![
+            "garbage", "garbage", "garbage",
+        ]));
         let partition1: Arc<dyn Array> =
             Arc::new(arrow::array::StringArray::from(vec!["a", "a", "a"]));
         let partition2: Arc<dyn Array> =
@@ -1596,11 +1604,14 @@ mod tests {
 
         let actual_data = read_string_data(batches);
 
-        let expected_data = expected_data.into_iter().map(|data| {
-            data.into_iter()
-                .map(|x| x.replace("file_name", file_name))
-                .collect::<Vec<_>>()
-        }).collect::<Vec<_>>();
+        let expected_data = expected_data
+            .into_iter()
+            .map(|data| {
+                data.into_iter()
+                    .map(|x| x.replace("file_name", file_name))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         assert_eq!(actual_data, expected_data);
     }
 
@@ -1609,41 +1620,34 @@ mod tests {
         batch
             .columns()
             .into_iter()
-            .map(|column| {
-                match column.data_type() {
-                    DataType::Utf8 => {
-                        column
-                            .as_string::<i32>()
-                            .iter()
-                            .map(Option::unwrap)
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    }
-                    DataType::Dictionary(_, _) => {
-                        column.as_dictionary::<UInt16Type>()
-                            .downcast_dict::<StringArray>()
-                            .unwrap()
-                            .into_iter()
-                            .map(Option::unwrap)
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    }
-                    DataType::UInt64 => {
-                        column.as_primitive::<UInt64Type>()
-                            .into_iter()
-                            .map(Option::unwrap)
-                            .map(|x| x.to_string())
-                            .collect::<Vec<_>>()
-                    }
-                    DataType::Int32 => {
-                        column.as_primitive::<Int32Type>()
-                            .into_iter()
-                            .map(Option::unwrap)
-                            .map(|x| x.to_string())
-                            .collect::<Vec<_>>()
-                    }
-                    _ => panic!("Unsupported type {}", column.data_type())
-                }
+            .map(|column| match column.data_type() {
+                DataType::Utf8 => column
+                    .as_string::<i32>()
+                    .iter()
+                    .map(Option::unwrap)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+                DataType::Dictionary(_, _) => column
+                    .as_dictionary::<UInt16Type>()
+                    .downcast_dict::<StringArray>()
+                    .unwrap()
+                    .into_iter()
+                    .map(Option::unwrap)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+                DataType::UInt64 => column
+                    .as_primitive::<UInt64Type>()
+                    .into_iter()
+                    .map(Option::unwrap)
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>(),
+                DataType::Int32 => column
+                    .as_primitive::<Int32Type>()
+                    .into_iter()
+                    .map(Option::unwrap)
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>(),
+                _ => panic!("Unsupported type {}", column.data_type()),
             })
             .collect::<Vec<_>>()
     }
@@ -1664,11 +1668,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_partition1() {
-        case(
-            "select partition1 from test",
-            vec![vec!["a", "a"]],
-        )
-            .await;
+        case("select partition1 from test", vec![vec!["a", "a"]]).await;
     }
 
     #[tokio::test]
@@ -1686,7 +1686,7 @@ mod tests {
             "select partition2, value from test",
             vec![vec!["b", "b"], vec!["1", "3"]],
         )
-            .await;
+        .await;
     }
 
     #[tokio::test]
@@ -1704,7 +1704,7 @@ mod tests {
             "select partition2, partition1 from test",
             vec![vec!["b", "b"], vec!["a", "a"]],
         )
-            .await;
+        .await;
     }
 
     #[tokio::test]
@@ -1724,7 +1724,7 @@ mod tests {
             vec![vec!["0", "2"]],
             DeltaScanConfigBuilder::new().with_row_number_column(Some("row_number".to_string())),
         )
-            .await;
+        .await;
     }
 
     #[tokio::test]
@@ -1754,14 +1754,18 @@ mod tests {
             vec![vec!["file_name", "file_name"]],
             DeltaScanConfigBuilder::new().with_file_column_name(&"file_name"),
         )
-            .await;
+        .await;
     }
 
     #[tokio::test]
     async fn test_value_file_name_partition1() {
         case_with_config(
             "select value, file_name, partition1 from test",
-            vec![vec!["1", "3"], vec!["file_name", "file_name"], vec!["a", "a"]],
+            vec![
+                vec!["1", "3"],
+                vec!["file_name", "file_name"],
+                vec!["a", "a"],
+            ],
             DeltaScanConfigBuilder::new().with_file_column_name(&"file_name"),
         )
         .await;
@@ -1771,7 +1775,11 @@ mod tests {
     async fn test_partition2_file_name_value() {
         case_with_config(
             "select partition2, file_name, value from test",
-            vec![vec!["b", "b"], vec!["file_name", "file_name"], vec!["1", "3"]],
+            vec![
+                vec!["b", "b"],
+                vec!["file_name", "file_name"],
+                vec!["1", "3"],
+            ],
             DeltaScanConfigBuilder::new().with_file_column_name(&"file_name"),
         )
         .await;
@@ -1784,7 +1792,7 @@ mod tests {
             vec![vec!["b", "b"], vec!["file_name", "file_name"]],
             DeltaScanConfigBuilder::new().with_file_column_name(&"file_name"),
         )
-            .await;
+        .await;
     }
 
     #[tokio::test]
@@ -1792,16 +1800,24 @@ mod tests {
         let file_name = "hello world";
         case_with_config(
             "select partition2, file_name, value, row_number from test",
-            vec![vec!["b", "b"],vec!["file_name", "file_name"], vec!["1", "3"], vec!["0", "2"]],
+            vec![
+                vec!["b", "b"],
+                vec!["file_name", "file_name"],
+                vec!["1", "3"],
+                vec!["0", "2"],
+            ],
             DeltaScanConfigBuilder::new()
                 .with_row_number_column(Some("row_number".to_string()))
                 .with_file_column_name(&"file_name"),
-        ).await;
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn read_spark_deletion_vectors() {
-        let mut table = DeltaTableBuilder::from_uri("./tests/data/spark/deletion-vectors").build().unwrap();
+        let mut table = DeltaTableBuilder::from_uri("./tests/data/spark/deletion-vectors")
+            .build()
+            .unwrap();
         table.load().await.unwrap();
 
         let batches = read_from_test_table(&table, "select value from test order by value").await;
@@ -1811,7 +1827,9 @@ mod tests {
 
     #[tokio::test]
     async fn read_spark_deletion_vectors_2() {
-        let mut table = DeltaTableBuilder::from_uri("./tests/data/spark/deletion-vectors-2").build().unwrap();
+        let mut table = DeltaTableBuilder::from_uri("./tests/data/spark/deletion-vectors-2")
+            .build()
+            .unwrap();
         table.load().await.unwrap();
 
         let batches = read_from_test_table(&table, "select value from test order by value").await;

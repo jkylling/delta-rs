@@ -61,14 +61,21 @@ impl FileSource for DeletionVectorFileSource {
             .index_of(self.is_row_deleted_column.name())
             .expect("is_deleted_column must be part of file schema");
         let base_config = cheaper_clone(base_config);
-        let projection = base_config.projection.as_ref().map(|projection| projection.iter()
-            .filter(|idx| **idx != is_deleted_column_index)
-            .cloned()
-            .collect()
-        ).unwrap_or_else(|| (0..base_config.file_schema.fields().len())
-            .filter(|idx| *idx != is_deleted_column_index)
-            .collect(),
-        );
+        let projection = base_config
+            .projection
+            .as_ref()
+            .map(|projection| {
+                projection
+                    .iter()
+                    .filter(|idx| **idx != is_deleted_column_index)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                (0..base_config.file_schema.fields().len())
+                    .filter(|idx| *idx != is_deleted_column_index)
+                    .collect()
+            });
         let base_config = base_config.with_projection(Some(projection));
         // At the moment, the only parts of base_config used by the Parquet opener is file schema and projection
         let inner = self
