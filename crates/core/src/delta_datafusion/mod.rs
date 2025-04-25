@@ -31,7 +31,7 @@ use arrow_array::{Array, DictionaryArray, RecordBatch, StringArray, TypedDiction
 use arrow_cast::display::array_value_to_string;
 use arrow_cast::{cast_with_options, CastOptions};
 use arrow_schema::{
-    ArrowError, DataType as ArrowDataType, Field, FieldRef, Schema as ArrowSchema, SchemaRef,
+    ArrowError, DataType as ArrowDataType, Field, Schema as ArrowSchema, SchemaRef,
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
 use arrow_select::concat::concat_batches;
@@ -85,9 +85,7 @@ use url::Url;
 use crate::delta_datafusion::expr::parse_predicate_expression;
 use crate::delta_datafusion::schema_adapter::DeltaSchemaAdapterFactory;
 use crate::errors::{DeltaResult, DeltaTableError};
-use crate::kernel::{
-    Add, DataCheck, DeletionVectorDescriptor, EagerSnapshot, Invariant, Snapshot, StructTypeExt,
-};
+use crate::kernel::{Add, DataCheck, EagerSnapshot, Invariant, Snapshot, StructTypeExt};
 use crate::logstore::LogStoreRef;
 use crate::table::builder::ensure_table_uri;
 use crate::table::state::DeltaTableState;
@@ -853,20 +851,19 @@ impl<'a> DeltaScanBuilder<'a> {
                 config
                     .row_number_column
                     .is_none()
-                    .then(|| row_number_column.as_ref()),
+                    .then_some(row_number_column.as_ref()),
                 config
                     .is_row_deleted_column
                     .is_none()
-                    .then(|| is_row_deleted_column.as_ref()),
+                    .then_some(is_row_deleted_column.as_ref()),
             ]
             .into_iter()
             .flatten()
             .flatten()
-            .map(|field| schema.index_of(field.name()).ok())
-            .flatten()
+            .filter_map(|field| schema.index_of(field.name()).ok())
             .collect::<Vec<_>>();
 
-            let mut current_projection = (0..scan.schema().fields().len())
+            let current_projection = (0..scan.schema().fields().len())
                 .filter(|idx| !indexes_to_remove.contains(idx))
                 .collect::<Vec<usize>>();
 
@@ -2174,7 +2171,7 @@ mod tests {
     use arrow::array::StructArray;
     use arrow::datatypes::{Field, Schema};
     use arrow_array::cast::AsArray;
-    use arrow_array::types::{Int64Type, UInt64Type};
+    use arrow_array::types::UInt64Type;
     use bytes::Bytes;
     use chrono::{TimeZone, Utc};
     use datafusion::assert_batches_sorted_eq;
@@ -3372,7 +3369,7 @@ mod tests {
         let df = ctx.sql("select row_number, value from test").await.unwrap();
         let plan = df.create_physical_plan().await.unwrap();
 
-        let mut stream = plan.execute(0, state.task_ctx()).unwrap();
+        let stream = plan.execute(0, state.task_ctx()).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.expect("Failed to collect");
         assert_eq!(1, batches.len());
         let batch = &batches[0];

@@ -25,22 +25,19 @@ use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion::prelude::Expr;
-use datafusion_common::{HashSet, ScalarValue};
+use datafusion_common::ScalarValue;
 use datafusion_expr::{lit, Extension, LogicalPlan, LogicalPlanBuilder, UserDefinedLogicalNode};
 use datafusion_physical_plan::metrics::MetricBuilder;
 use datafusion_physical_plan::ExecutionPlan;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::io;
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Int64Type, UInt64Type};
+use arrow_array::types::UInt64Type;
 use arrow_array::RecordBatch;
-use bytes::{BufMut, Bytes, BytesMut};
 use datafusion::execution::TaskContext;
 use futures::future::BoxFuture;
 use futures::StreamExt;
-use itertools::Itertools;
 use object_store::path::Path;
 use object_store::{ObjectStore, PutPayload};
 use std::sync::Arc;
@@ -64,8 +61,7 @@ use crate::delta_datafusion::{
     DeltaSessionContext, DeltaTableProvider, PATH_COLUMN,
 };
 use crate::errors::DeltaResult;
-use crate::kernel::arrow::extract::ProvidesColumnByName;
-use crate::kernel::{Action, Add, DeletionVectorDescriptor, Remove, StorageType};
+use crate::kernel::{Action, Add, DeletionVectorDescriptor, Remove};
 use crate::logstore::LogStoreRef;
 use crate::operations::deletion_vectors::write_deletion_vectors_file;
 use crate::operations::write::execution::{write_execution_plan, write_execution_plan_cdc};
@@ -319,7 +315,7 @@ async fn execute_non_empty_expr(
         write_cdc(
             snapshot,
             log_store.clone(),
-            &expression,
+            expression,
             &state,
             writer_properties,
             operation_id,
@@ -343,7 +339,6 @@ async fn execute_deletion_vectors(
     operation_id: Uuid,
 ) -> DeltaResult<Vec<Action>> {
     let mut actions: Vec<Action> = Vec::new();
-    let table_partition_cols = snapshot.metadata().partition_columns.clone();
 
     let delete_planner = DeltaPlanner::<DeleteMetricExtensionPlanner> {
         extension_planner: DeleteMetricExtensionPlanner {},
@@ -364,7 +359,6 @@ async fn execute_deletion_vectors(
         DeltaTableProvider::try_new(snapshot.clone(), log_store.clone(), scan_config.clone())?
             .with_files(rewrite.to_vec()),
     );
-    use datafusion::datasource::TableProvider;
     let target_provider = provider_as_source(target_provider);
     let source = LogicalPlanBuilder::scan("target", target_provider.clone(), None)?.build()?;
 
@@ -377,14 +371,6 @@ async fn execute_deletion_vectors(
     });
 
     let df = DataFrame::new(state.clone(), source);
-
-    let writer_stats_config = WriterStatsConfig::new(
-        snapshot.table_config().num_indexed_cols(),
-        snapshot
-            .table_config()
-            .stats_columns()
-            .map(|v| v.iter().map(|v| v.to_string()).collect::<Vec<String>>()),
-    );
 
     // Apply the filter and rewrite files
     let filter_expression = Expr::IsTrue(Box::new(expression.clone()));
@@ -415,7 +401,7 @@ async fn execute_deletion_vectors(
         write_cdc(
             snapshot,
             log_store.clone(),
-            &expression,
+            expression,
             &state,
             writer_properties,
             operation_id,
@@ -452,22 +438,24 @@ impl DeletionVectorWriter {
                 ))
             })?
             .as_primitive::<UInt64Type>();
-        let file_dictionary = get_path_column(&batch, PATH_COLUMN)?;
+        let file_dictionary = get_path_column(batch, PATH_COLUMN)?;
         let mut file_names = file_dictionary.into_iter();
         let mut row_numbers = row_numbers.iter();
         let mut groups: HashMap<&str, Vec<u64>> = HashMap::new();
         while let (Some(row_number), Some(file_name)) = (row_numbers.next(), file_names.next()) {
-            groups // TODO: Check unwraps
-                .entry(file_name.unwrap())
+            groups
+                .entry(file_name.expect("Null file name"))
                 .or_default()
-                .push(row_number.unwrap());
+                .push(row_number.expect("Null row number"));
         }
         for (file_name, row_numbers) in groups {
-            // TODO: Avoid to_string
-            self.deletion_vectors
-                .entry(file_name.to_string())
-                .or_default()
-                .extend(row_numbers);
+            if let Some(deletion_vector) = self.deletion_vectors.get_mut(file_name) {
+                deletion_vector.extend(row_numbers);
+            } else {
+                let deletion_vector = RoaringTreemap::from_iter(row_numbers);
+                self.deletion_vectors
+                    .insert(file_name.to_string(), deletion_vector);
+            }
         }
         Ok(())
     }
@@ -512,7 +500,7 @@ async fn deletion_vectors_execution_plan(
         for (k, v) in part {
             match result.entry(k) {
                 Entry::Occupied(mut occupied) => occupied.get_mut().extend(&v),
-                Entry::Vacant(mut vacant) => {
+                Entry::Vacant(vacant) => {
                     vacant.insert(v);
                 }
             }
@@ -622,7 +610,7 @@ async fn execute(
     metrics.scan_time_ms = Instant::now().duration_since(scan_start).as_millis() as u64;
 
     let predicate = predicate.unwrap_or(Expr::Literal(ScalarValue::Boolean(Some(true))));
-    let mut actions = {
+    let actions = {
         let write_start = Instant::now();
         let add = if !deletion_vectors {
             let mut actions = execute_non_empty_expr(
@@ -773,8 +761,8 @@ impl std::future::IntoFuture for DeleteBuilder {
 
 #[cfg(test)]
 mod tests {
+    use crate::delta_datafusion::DeltaScanConfigBuilder;
     use crate::delta_datafusion::DeltaTableProvider;
-    use crate::delta_datafusion::{DeltaScanConfig, DeltaScanConfigBuilder};
     use crate::kernel::{DataType as DeltaDataType, StorageType};
     use crate::operations::collect_sendable_stream;
     use crate::operations::delete::DeletionVectorDescriptor;
@@ -799,7 +787,7 @@ mod tests {
     use arrow_buffer::NullBuffer;
     use arrow_schema::DataType;
     use arrow_schema::Fields;
-    use bytes::BufMut;
+
     use datafusion::assert_batches_sorted_eq;
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::*;
@@ -808,8 +796,7 @@ mod tests {
     use object_store::path::Path;
     use object_store::ObjectStore;
     use serde_json::json;
-    use std::io::Write;
-    use std::path::{absolute, PathBuf};
+
     use std::sync::Arc;
     use url::Url;
 
@@ -1456,7 +1443,7 @@ mod tests {
         let state = ctx.state();
         let df = ctx.sql(sql.as_ref()).await.unwrap();
         let plan = df.create_physical_plan().await.unwrap();
-        let mut stream = plan.execute(0, state.task_ctx()).unwrap();
+        let stream = plan.execute(0, state.task_ctx()).unwrap();
         stream.try_collect().await.expect("Failed to collect")
     }
 
@@ -1464,7 +1451,6 @@ mod tests {
     async fn test_delete_with_deletion_vectors() {
         let values: Arc<dyn Array> = Arc::new(arrow::array::StringArray::from(vec!["1", "2", "3"]));
         let batch = RecordBatch::try_from_iter(vec![("value", values)]).unwrap();
-        let schema = batch.schema();
 
         // write some data
         let table = DeltaOps::new_in_memory()
@@ -1572,7 +1558,6 @@ mod tests {
             ("garbage5", garbage.clone()),
         ])
         .unwrap();
-        let schema = batch.schema();
 
         // write some data
         let table = DeltaOps::new_in_memory()
@@ -1582,7 +1567,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut adds = table
+        let adds = table
             .snapshot()
             .unwrap()
             .file_actions_iter()
@@ -1591,7 +1576,7 @@ mod tests {
         let file_name = adds[0].path.as_str();
 
         // Delete data from table
-        let (table, metrics) = DeltaOps(table)
+        let (table, _metrics) = DeltaOps(table)
             .delete()
             .with_predicate(col("value").eq(lit(2)))
             .with_deletion_vectors(true)
@@ -1619,7 +1604,7 @@ mod tests {
         let batch = batches.first().unwrap();
         batch
             .columns()
-            .into_iter()
+            .iter()
             .map(|column| match column.data_type() {
                 DataType::Utf8 => column
                     .as_string::<i32>()
@@ -1797,7 +1782,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_partition2_file_name_value_row_number() {
-        let file_name = "hello world";
         case_with_config(
             "select partition2, file_name, value, row_number from test",
             vec![

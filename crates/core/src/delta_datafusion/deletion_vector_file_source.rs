@@ -15,7 +15,7 @@ use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::DisplayFormatType;
 use futures::future::Either;
 use futures::stream::BoxStream;
-use futures::{try_join, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{try_join, StreamExt, TryFutureExt};
 use object_store::ObjectStore;
 use roaring::RoaringTreemap;
 use std::any::Any;
@@ -189,7 +189,7 @@ fn cheaper_clone(config: &FileScanConfig) -> FileScanConfig {
     let FileScanConfig {
         object_store_url,
         file_schema,
-        file_groups,
+        // file_groups,
         constraints,
         statistics,
         projection,
@@ -199,6 +199,7 @@ fn cheaper_clone(config: &FileScanConfig) -> FileScanConfig {
         file_compression_type,
         new_lines_in_values,
         file_source,
+        ..
     } = config;
     FileScanConfig {
         object_store_url: object_store_url.clone(),
@@ -207,11 +208,11 @@ fn cheaper_clone(config: &FileScanConfig) -> FileScanConfig {
         constraints: constraints.clone(),
         statistics: statistics.clone(),
         projection: projection.clone(),
-        limit: limit.clone(),
+        limit: *limit,
         table_partition_cols: table_partition_cols.clone(),
         output_ordering: output_ordering.clone(),
-        file_compression_type: file_compression_type.clone(),
-        new_lines_in_values: new_lines_in_values.clone(),
+        file_compression_type: *file_compression_type,
+        new_lines_in_values: *new_lines_in_values,
         file_source: file_source.clone(),
     }
 }

@@ -1,21 +1,12 @@
-use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
-use datafusion_physical_plan::ExecutionPlan;
 use std::collections::HashMap;
 use std::io;
 
-use arrow_array::cast::AsArray;
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::StreamExt;
-use itertools::Itertools;
-use object_store::ObjectStore;
-use parquet::data_type::AsBytes;
 use uuid::Uuid;
 
 use crate::errors::DeltaResult;
 use crate::kernel::{DeletionVectorDescriptor, StorageType};
-use crate::operations::CustomExecuteHandler;
 use roaring::RoaringTreemap;
-use serde::Serialize;
 
 const DELETION_VECTOR_MAGIC: [u8; 4] = 1681511377u32.to_be_bytes();
 const DELETION_VECTOR_FILE_FORMAT_VERSION_1: u8 = 1;
@@ -67,6 +58,7 @@ where
     Ok((result, buffer.freeze()))
 }
 
+#[derive(Debug, PartialEq)]
 struct PartialDeletionVectorDescriptor {
     offset: i32,
     size_in_bytes: i32,
@@ -108,12 +100,10 @@ pub fn deserialize_deletion_vector(
 mod tests {
     use crate::kernel::actions::DeletionVectorDescriptor;
     use crate::kernel::StorageType;
-    use crate::operations::deletion_vectors::deserialize_deletion_vector;
-    use arrow::array::Array;
-    use arrow::array::AsArray;
+    use crate::operations::deletion_vectors::{
+        deserialize_deletion_vector, PartialDeletionVectorDescriptor,
+    };
     use bytes::BytesMut;
-    use object_store::ObjectStore;
-    use parquet::data_type::AsBytes;
     use roaring::RoaringTreemap;
     use std::collections::BTreeMap;
     use uuid::Uuid;
@@ -136,6 +126,14 @@ mod tests {
         let expected = RoaringTreemap::from_iter(vec![1, 2, 3]);
         let result = super::write_deletion_vector(&mut buffer, &expected)
             .expect("Failed to write deletion vector");
+        assert_eq!(
+            result,
+            PartialDeletionVectorDescriptor {
+                offset: 0,
+                size_in_bytes: 38,
+                cardinality: 3,
+            }
+        );
         let actual = super::deserialize_deletion_vector(
             &buffer.freeze(),
             &DeletionVectorDescriptor {
