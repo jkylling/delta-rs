@@ -94,13 +94,13 @@ arrow-select = { version = "54", path = "../arrow-rs/arrow-select" }
 #object_store = { version = "0.11.2", path = "../arrow-rs/object_store"}
 parquet = { version = "54", path = "../arrow-rs/parquet" }
 
-datafusion = { path = "../datafusion/datafusion/core" }
-datafusion-expr = { path = "../datafusion/datafusion/expr" }
-datafusion-common = { path = "../datafusion/datafusion/common" }
-datafusion-ffi = { path = "../datafusion/datafusion/ffi" }
-datafusion-functions = { path = "../datafusion/datafusion/functions" }
-datafusion-functions-aggregate = { path = "../datafusion/datafusion/functions-aggregate" }
-datafusion-physical-expr = { path = "../datafusion/datafusion/physical-expr" }
-datafusion-physical-plan = { path = "../datafusion/datafusion/physical-plan" }
-datafusion-proto = { path = "../datafusion/datafusion/proto" }
-datafusion-sql = { path = "../datafusion/datafusion/sql" }
+datafusion = { git = "https://github.com/jkylling/datafusion.git", branch = "feature/parquet-row-numbers" }
+datafusion-expr = { git = "https://github.com/jkylling/datafusion.git", branch = "feature/parquet-row-numbers" }
+datafusion-common = { git = "https://github.com/jkylling/datafusion.git", branch = "feature/parquet-row-numbers" }
+datafusion-ffi = { git = "https://github.com/jkylling/datafusion.git", branch = "feature/parquet-row-numbers" }
+datafusion-functions = { git = "https://github.com/jkylling/datafusion.git", branch = "feature/parquet-row-numbers" }
+datafusion-functions-aggregate = { git = "https://github.com/jkylling/datafusion.git", branch = "feature/parquet-row-numbers" }
+datafusion-physical-expr = { git = "https://github.com/jkylling/datafusion.git", branch = "feature/parquet-row-numbers" }
+datafusion-physical-plan = { git = "https://github.com/jkylling/datafusion.git", branch = "feature/parquet-row-numbers" }
+datafusion-proto = { git = "https://github.com/jkylling/datafusion.git", branch = "feature/parquet-row-numbers" }
+datafusion-sql = { git = "https://github.com/jkylling/datafusion.git", branch = "feature/parquet-row-numbers" }
