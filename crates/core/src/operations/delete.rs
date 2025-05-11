@@ -763,7 +763,7 @@ impl std::future::IntoFuture for DeleteBuilder {
 mod tests {
     use crate::delta_datafusion::DeltaScanConfigBuilder;
     use crate::delta_datafusion::DeltaTableProvider;
-    use crate::kernel::{DataType as DeltaDataType, StorageType};
+    use crate::kernel::{actions, DataType as DeltaDataType, StorageType};
     use crate::operations::collect_sendable_stream;
     use crate::operations::delete::DeletionVectorDescriptor;
     use crate::operations::DeltaOps;
@@ -1528,6 +1528,101 @@ mod tests {
         let values = value.iter().collect::<Vec<_>>();
         assert_eq!(values, vec![Some("2"), Some("3")]);
     }
+
+    #[tokio::test]
+    async fn test_delete_twice() {
+        let values: Arc<dyn Array> = Arc::new(arrow::array::StringArray::from(vec!["1", "2", "3"]));
+        let batch = RecordBatch::try_from_iter(vec![("value", values)]).unwrap();
+
+        // write some data
+        let table = DeltaOps::new_in_memory()
+            .write(vec![batch.clone()])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+        let snapshot = table.snapshot().expect("Failed to get snapshot");
+        let mut adds = snapshot
+            .file_actions_iter()
+            .expect("Failed to get file actions")
+            .collect::<Vec<_>>();
+        assert_eq!(adds.len(), 1);
+        let original_add = single_add(&table);
+
+        let (table, metrics) = DeltaOps(table)
+            .delete()
+            .with_predicate(col("value").eq(lit(1)))
+            .with_deletion_vectors(true)
+            .await
+            .unwrap();
+        assert_eq!(table.version(), 1);
+        assert_eq!(table.get_files_count(), 1);
+        assert_eq!(metrics.num_added_files, 1);
+        assert_eq!(metrics.num_removed_files, 1);
+        assert_eq!(metrics.num_deleted_rows, 1);
+        assert_eq!(metrics.num_copied_rows, 0);
+        let mut new_add = single_add(&table);
+        let deletion_vector = new_add
+            .deletion_vector
+            .take()
+            .expect("No deletion vector");
+        assert_eq!(original_add, new_add);
+        assert_eq!(
+            deletion_vector,
+            DeletionVectorDescriptor {
+                storage_type: StorageType::UuidRelativePath,
+                path_or_inline_dv: deletion_vector.path_or_inline_dv.clone(),
+                offset: Some(1),
+                size_in_bytes: 34,
+                cardinality: 1,
+            }
+        );
+
+
+        let (table, metrics) = DeltaOps(table)
+            .delete()
+            .with_predicate(col("value").eq(lit(2)))
+            .with_deletion_vectors(true)
+            .await
+            .unwrap();
+
+        assert_eq!(table.version(), 2);
+        assert_eq!(table.get_files_count(), 1);
+        assert_eq!(metrics.num_added_files, 1);
+        assert_eq!(metrics.num_removed_files, 1);
+        assert_eq!(metrics.num_deleted_rows, 1);
+        assert_eq!(metrics.num_copied_rows, 0);
+
+        let mut new_add = single_add(&table);
+        let deletion_vector = new_add
+            .deletion_vector
+            .take()
+            .expect("No deletion vector");
+        assert_eq!(original_add, new_add);
+        assert_eq!(
+            deletion_vector,
+            DeletionVectorDescriptor {
+                storage_type: StorageType::UuidRelativePath,
+                path_or_inline_dv: deletion_vector.path_or_inline_dv.clone(),
+                offset: Some(1),
+                size_in_bytes: 34,
+                cardinality: 1,
+            }
+        );
+
+        let batches = read_from_test_table(&table, "select value from test").await;
+        assert_eq!(read_string_data(batches), vec![vec!["3"]]);
+    }
+
+    fn single_add(table: &DeltaTable) -> actions::Add {
+        let snapshot = table.snapshot().expect("Failed to get snapshot");
+        let mut adds = snapshot
+            .file_actions_iter()
+            .expect("Failed to get file actions")
+            .collect::<Vec<_>>();
+        assert_eq!(adds.len(), 1);
+        adds.pop().unwrap()
+    }
+
     async fn case(sql: &str, expected_data: Vec<Vec<&str>>) {
         case_with_config(sql, expected_data, Default::default()).await
     }
